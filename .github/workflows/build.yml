@@ -17,7 +17,7 @@ jobs:
             -v ${{ github.workspace }}:/build \
             -w /build \
             theypsilon/quartus-lite-c5:17.0.2.docker0 \
-            bash -c 'QSH=$(find / -iname "quartus_sh" 2>/dev/null | head -n1); echo "Trovato in: $QSH"; "$QSH" --flow compile Arcade-SegaSystem32Multi.qpf'
+            bash -c 'QSH=$(find / -iname "quartus_sh" 2>/dev/null | grep -v uninstall | head -n1); echo "Trovato in: $QSH"; "$QSH" --flow compile Arcade-SegaSystem32Multi.qpf'
 
       - name: Upload RBF
         uses: actions/upload-artifact@v4
