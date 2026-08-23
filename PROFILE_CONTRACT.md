@@ -181,6 +181,82 @@ bring-up over a physical cable. Both remain open, and the separate
 Rad Mobile/Rad Rally non-OutRunners build-profile task also remains
 explicitly not started (same authorization gate as above).
 
+## 2026-08-23: PLL hand-reconstruction (main system clock, NOT hardware-verified)
+
+The user set up a GitHub Actions CI pipeline (`.github/workflows/build.yml`,
+`theypsilon/quartus-lite-c5:17.0.2.docker0` Docker image, `quartus_sh --flow
+compile`) to build a real `.rbf`, the first time this project ever actually
+ran Quartus rather than Verilator. That build failed with `Error (12006):
+Node instance "pll" instantiates undefined entity "pll"` at
+`Arcade-SegaSystem32Multi.sv:220`.
+
+Root cause, confirmed by reading the repo's own `.gitignore`: it excluded
+`rtl/pll/synthesis/` (and `rtl/pll/pll.qsys`), which is exactly where
+`rtl/pll/pll.qip` expects the main system PLL's real Quartus/Qsys-generated
+IP output to live. `rtl/pll/pll.v` is only a documented-as-fake placeholder
+("Do not fall back to pll.v for hardware: that placeholder passes 50 MHz
+through and cannot produce a valid release bitstream" -- comment already in
+`rtl/pll/pll.qip`). `tools/make_pll.tcl`, referenced by a comment as the
+regeneration tool, does not exist in this checkout either. **This means the
+repository, exactly as received before this session, could not have been
+compiled into a working `.rbf` by anyone** -- not a CI issue, not a
+Mac/Docker issue, a pre-existing gap with no relation to the comm-link work
+above. The other 3 PLLs in the project (`pll_hdmi`, `pll_audio`, `pll_cfg`,
+all under `sys/`) ARE committed normally; only this one, main-clock PLL was
+excluded, apparently by mistake.
+
+No `.qsys` source and no upstream copy with the generated files were
+available in this session, so a normal "just find/regenerate the IP" fix
+was not possible. Instead this session hand-derived and hand-wrote a
+replacement `altera_pll` instance (`rtl/pll/synthesis/pll.qip`, `pll.v`,
+`pll_0002.v`), removed the `.gitignore` line that had been silently
+swallowing this folder, and confirmed algebraically (not just asserted)
+that the formula used is correct by first reverse-solving it against
+`sys/pll_hdmi/pll_hdmi_0002.v`'s own already-working numbers: that PLL's
+`m_cnt_hi_div/lo_div=4/4`, `n_cnt_bypass_en="true"`,
+`pll_fractional_division="3908420153"` give `VCO = 50 MHz * (8 +
+3908420153/2^32) / 1 = 445.499999 MHz`, and `/c_cnt0=3` gives `148.499999
+MHz` -- exactly matching that file's own documented `output_clock_frequency0
+= "148.500000 MHz"`. This confirms the general formula `VCO = refclk *
+(M_int + K/2^32) / N_int`, `output_i = VCO / C_i`, `M_int`/`N_int`/`C_i` =
+that counter's `hi_div + lo_div` when not bypassed.
+
+Applying that formula to the four target frequencies documented in
+`Arcade-SegaSystem32Multi.sv`'s `pll pll (...)` instantiation comments
+(96.634615 MHz clk_ram, 48.317307 MHz clk_sys, 96.634615 MHz SDRAM_CLK at
+~180 deg, 24.158653 MHz clk_v25 -- note clk_ram=2x clk_sys and
+clk_v25=clk_sys/2 exactly, so all four are C0/2C0/C0/4C0 off one VCO): the
+repeating-decimal pattern factors exactly as `96.634615384615... MHz =
+5025/52 MHz`. Picking `C0=8` gives `VCO = 5025/52 * 8 = 10050/13 =
+773.076923... MHz`, and `VCO/refclk = 201/13` -- both small enough integers
+(M=201, N=13, both odd, needing `m_cnt_odd_div_duty_en`/
+`n_cnt_odd_div_duty_en = "true"`) to need zero fractional correction at all
+(`pll_fractional_division="0"`), an exact rather than approximated ratio.
+C1=16 (clk_sys=VCO/16), C3=32 (clk_v25=VCO/32) fall out of the same VCO
+exactly. The SDRAM_CLK 180-degree shift was approximated with a coarse
+whole-VCO-cycle preset (`c_cnt_prst2=4`, half of C0=8) rather than the
+finer sub-cycle phase-mux mechanism, since that mechanism's exact semantics
+could not be verified without a working Quartus GUI reference. The analog
+charge-pump/bandwidth parameters (`pll_cp_current=20`, `pll_bwctrl=4000`)
+were carried over unchanged from `pll_hdmi`'s working instance as a
+starting point; that instance's VCO (445.5 MHz) is well below this one's
+(773 MHz), so these may not be optimally tuned for this VCO and could need
+retuning after a real hardware test.
+
+Explicitly NOT done, and NOT verified: this PLL reconstruction has NOT been
+tested with a completed Quartus compile (the CI run that surfaced this
+finding was still in progress being re-run with the fix at the time of this
+entry), NOT tested on real DE10-Nano hardware, and the exact hardware
+correctness of the M/N/C reverse-engineering -- while internally consistent
+and cross-checked against a real working example -- has not been confirmed
+by Intel/Altera's own Cyclone V fPLL documentation. Treat every clock this
+PLL drives (video timing, SDRAM interface, the V60/V25 CPU compute domains,
+and by extension the comm-link's own `CLK_HZ` assumption) as unverified
+until a real board boot is confirmed. If the resulting core visibly
+misbehaves (no video, SDRAM errors, audio pitch wrong), this PLL
+reconstruction -- not the comm-link RTL, which was independently verified
+by Verilator earlier -- is the first place to suspect.
+
 ## 2026-08-23: independent P1/P2 paddle and spinner steering
 
 The OutRunners top previously exposed P1/P2 signed analog-stick steering but

@@ -1,0 +1,16 @@
+# Hand-reconstructed replacement for the original (never-committed) Qsys/
+# MegaWizard output. See PROFILE_CONTRACT.md, 2026-08-23 "PLL
+# hand-reconstruction" entry, for the derivation and known risks
+# (not yet verified on real hardware).
+set_global_assignment -entity "pll" -library "pll" -name IP_TOOL_NAME "altera_pll"
+set_global_assignment -entity "pll" -library "pll" -name IP_TOOL_VERSION "17.0"
+set_global_assignment -entity "pll" -library "pll" -name IP_TOOL_ENV "mwpim"
+set_global_assignment -name SYNTHESIS_ONLY_QIP ON
+
+set_global_assignment -library "pll" -name VERILOG_FILE [file join $::quartus(qip_path) "pll.v"]
+set_global_assignment -library "pll" -name VERILOG_FILE [file join $::quartus(qip_path) "pll_0002.v"]
+
+set_instance_assignment -name PLL_COMPENSATION_MODE DIRECT -to "*pll_0002*|altera_pll:altera_pll_i*|*"
+set_instance_assignment -name PLL_CHANNEL_SPACING "0.0 KHz" -to "*pll_0002*|altera_pll:altera_pll_i*|*"
+set_instance_assignment -name PLL_AUTO_RESET ON -to "*pll_0002*|altera_pll:altera_pll_i*|*"
+set_instance_assignment -name PLL_BANDWIDTH_PRESET AUTO -to "*pll_0002*|altera_pll:altera_pll_i*|*"
