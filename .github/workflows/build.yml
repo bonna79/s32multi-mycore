@@ -1,0 +1,23 @@
+name: Build RBF
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: theypsilon/quartus-lite-c5:17.0.2.docker0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile with Quartus
+        run: quartus_sh --flow compile Arcade-SegaSystem32Multi.qpf
+
+      - name: Upload RBF
+        uses: actions/upload-artifact@v4
+        with:
+          name: rbf-compilato
+          path: output_files/*.rbf
