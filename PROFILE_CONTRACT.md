@@ -255,8 +255,24 @@ final fit 79,062 logic cells / 2,132 RAM segments / 1 PLL / 59 DSP on a
 5CSEBA6U23I7), and the Assembler completed with 0 errors and generated the
 `.rbf`. This closes the "undefined entity pll" blocker and is the first real
 confirmation that the hand-derived parameters are not just internally
-consistent but accepted end-to-end by the real Quartus toolchain. It is
-still not a hardware confirmation.
+consistent but accepted end-to-end by the real Quartus toolchain.
+
+**2026-08-23 update -- first real hardware boot.** The `.rbf` from the CI
+run that also included the `tools/quartus_report_top_paths.tcl` fix (see
+next section) was loaded onto a real DE10-Nano/MiSTer and booted the
+OutRunners ("Head to Head!") parent successfully: clean, stable video with
+correct colors and no visible glitching, and the OSD showing the new
+`Cabinet Link` (Standalone) / `Link Role` (Slave) entries added for the
+comm-link feature. This is the first real-hardware confirmation that the
+hand-reconstructed PLL produces a working pixel clock and CPU/SDRAM clocks
+well enough to boot and render a game -- a significant de-risking event,
+though it does not by itself clear the TimeQuest setup-slack warning below
+(that is a marginal timing-closure margin issue, not necessarily something
+that shows up as a visible glitch at room temperature on one specific
+board). `Cabinet Link` has not yet been tested in `Network` mode (a second
+board and the physical link cable were not yet available at the time of
+this entry) -- the comm-link RTL itself remains exactly as before, verified
+only by Verilator/behavioral-model simulation, not on real hardware.
 
 That same run's TimeQuest Timing Analyzer stage reported `Critical Warning
 (332148): Timing requirements not met`, with worst-case setup slack of
