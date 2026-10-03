@@ -11,6 +11,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Diagnose checked-out tree
+        run: |
+          echo "--- top-level files ---"
+          ls -la
+          echo "--- .qsf source file assignments ---"
+          grep -iE "SOURCE_FILE|VERILOG_FILE|SYSTEMVERILOG_FILE|QIP_FILE" Arcade-SegaSystem32Multi.qsf || true
+          echo "--- rtl tree size ---"
+          du -sh rtl 2>/dev/null || echo "rtl/ non trovata"
+          echo "--- eventuali LFS pointer ---"
+          grep -rl "git-lfs.github.com" . --include="*.sv" --include="*.v" 2>/dev/null || echo "nessun pointer LFS trovato"
+
       - name: Compile with Quartus (inside Docker)
         run: |
           docker run --rm \
@@ -29,4 +40,3 @@ jobs:
         with:
           name: rbf-compilato
           path: output_files/*.rbf
-          
