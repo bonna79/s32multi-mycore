@@ -15,12 +15,12 @@ jobs:
         run: |
           echo "--- top-level files ---"
           ls -la
-          echo "--- .qsf source file assignments ---"
-          grep -iE "SOURCE_FILE|VERILOG_FILE|SYSTEMVERILOG_FILE|QIP_FILE" Arcade-SegaSystem32Multi.qsf || true
+          echo "--- .qsf TOP_LEVEL / DEVICE / FAMILY / FLOW assignments ---"
+          grep -iE "TOP_LEVEL_ENTITY|^set_global_assignment -name DEVICE|^set_global_assignment -name FAMILY|FLOW_ENABLE|PROJECT_OUTPUT_DIRECTORY" Arcade-SegaSystem32Multi.qsf || true
+          echo "--- .qpf content ---"
+          cat Arcade-SegaSystem32Multi.qpf
           echo "--- rtl tree size ---"
           du -sh rtl 2>/dev/null || echo "rtl/ non trovata"
-          echo "--- eventuali LFS pointer ---"
-          grep -rl "git-lfs.github.com" . --include="*.sv" --include="*.v" 2>/dev/null || echo "nessun pointer LFS trovato"
 
       - name: Compile with Quartus (inside Docker)
         run: |
@@ -35,6 +35,10 @@ jobs:
               export LD_LIBRARY_PATH="$QDIR:$LD_LIBRARY_PATH"
               rm -f "$QDIR/libboost_system.so"
               "$QSH" --flow compile Arcade-SegaSystem32Multi.qpf
+              QEXIT=$?
+              echo "### QUARTUS_SH EXIT CODE: $QEXIT ###"
+              echo "--- contenuto cartella di lavoro dopo compile ---"
+              ls -la
               echo "--- output_files dopo compile ---"
               ls -la output_files/ 2>&1 || echo "output_files ASSENTE"
             '
