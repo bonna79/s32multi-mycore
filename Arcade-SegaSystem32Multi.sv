@@ -501,8 +501,8 @@ wire [7:0] p2a_dig = p_dig(joystick_1);
 // RXD in on USER_IN[0], meant for a direct cable between two DE10-Nano USER_IO
 // headers. Bits 1-6 remain unused/idle-high.
 wire comm_link_txd, comm_link_up;
-assign USER_OUT = {6'h3f, comm_link_txd};
-wire comm_link_rxd = USER_IN[0];
+assign USER_OUT = {5'h1f, 1'b1, comm_link_txd};
+wire comm_link_rxd = USER_IN[1];
 
 wire [7:0] core_p1a = p1a_dig;
 // OutRunners routes PLAYER 1's music keys through the P2_A port (MAME
