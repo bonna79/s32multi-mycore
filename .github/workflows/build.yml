@@ -30,9 +30,13 @@ jobs:
             theypsilon/quartus-lite-c5:17.0.2.docker0 \
             bash -c '
               QSH=$(find / -iname "quartus_sh" 2>/dev/null | grep -v uninstall | head -n1)
+              QDIR=$(dirname "$QSH")
               echo "Trovato in: $QSH"
-              export LD_LIBRARY_PATH="$(dirname "$QSH"):$LD_LIBRARY_PATH"
+              export LD_LIBRARY_PATH="$QDIR:$LD_LIBRARY_PATH"
+              rm -f "$QDIR/libboost_system.so"
               "$QSH" --flow compile Arcade-SegaSystem32Multi.qpf
+              echo "--- output_files dopo compile ---"
+              ls -la output_files/ 2>&1 || echo "output_files ASSENTE"
             '
 
       - name: Upload RBF
