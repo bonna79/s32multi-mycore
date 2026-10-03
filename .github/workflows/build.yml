@@ -11,19 +11,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Diagnose checked-out tree
-        run: |
-          echo "--- top-level files ---"
-          ls -la
-          echo "--- .qsf TOP_LEVEL / DEVICE / FAMILY / FLOW assignments ---"
-          grep -iE "TOP_LEVEL_ENTITY|^set_global_assignment -name DEVICE|^set_global_assignment -name FAMILY|FLOW_ENABLE|PROJECT_OUTPUT_DIRECTORY" Arcade-SegaSystem32Multi.qsf || true
-          echo "--- .qpf content ---"
-          cat Arcade-SegaSystem32Multi.qpf
-          echo "--- rtl tree size ---"
-          du -sh rtl 2>/dev/null || echo "rtl/ non trovata"
-
       - name: Compile with Quartus (inside Docker)
         run: |
+          echo "=== .qpf content ==="
+          cat Arcade-SegaSystem32Multi.qpf
+          echo "=== .qsf TOP_LEVEL / DEVICE / FAMILY ==="
+          grep -iE "TOP_LEVEL_ENTITY|^set_global_assignment -name DEVICE|^set_global_assignment -name FAMILY|PROJECT_OUTPUT_DIRECTORY" Arcade-SegaSystem32Multi.qsf || true
+          echo "=== avvio docker ==="
           docker run --rm \
             -v ${{ github.workspace }}:/build \
             -w /build \
@@ -37,9 +31,6 @@ jobs:
               "$QSH" --flow compile Arcade-SegaSystem32Multi.qpf
               QEXIT=$?
               echo "### QUARTUS_SH EXIT CODE: $QEXIT ###"
-              echo "--- contenuto cartella di lavoro dopo compile ---"
-              ls -la
-              echo "--- output_files dopo compile ---"
               ls -la output_files/ 2>&1 || echo "output_files ASSENTE"
             '
 
