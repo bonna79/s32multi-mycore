@@ -13,15 +13,11 @@ jobs:
 
       - name: Compile with Quartus (inside Docker)
         run: |
-          echo "=== .qpf content ==="
-          cat Arcade-SegaSystem32Multi.qpf
-          echo "=== .qsf TOP_LEVEL / DEVICE / FAMILY ==="
-          grep -iE "TOP_LEVEL_ENTITY|^set_global_assignment -name DEVICE|^set_global_assignment -name FAMILY|PROJECT_OUTPUT_DIRECTORY" Arcade-SegaSystem32Multi.qsf || true
           echo "=== avvio docker ==="
           docker run --rm \
             -v ${{ github.workspace }}:/build \
             -w /build \
-            theypsilon/quartus-lite-c5:17.0.2.docker0 \
+            theypsilon/quartus-lite-c5:17.0.2-heavy \
             bash -c '
               QSH=$(find / -iname "quartus_sh" 2>/dev/null | grep -v uninstall | head -n1)
               QDIR=$(dirname "$QSH")
@@ -39,3 +35,4 @@ jobs:
         with:
           name: rbf-compilato
           path: output_files/*.rbf
+          
