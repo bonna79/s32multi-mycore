@@ -1006,6 +1006,8 @@ s32_comm_link comm_link (
     .link_enable    (comm_link_enable),
     .link_master    (comm_link_master),
     .cabinet_id     (comm_cabinet_id),
+    .cn_enable      (comm_cn),
+    .vbl_start      (vbl_start),
     .link_txd       (comm_link_txd),
     .link_rxd       (comm_link_rxd),
     .link_up        (comm_link_up)
