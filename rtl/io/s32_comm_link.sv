@@ -1,76 +1,77 @@
 //============================================================================
-//  Sega System 32 / Multi 32 -- comm-board physical link (NEW, non-authentic
-//  transport; the register map it feeds is evidenced, the wire protocol is
-//  not).
+//  Sega Multi 32 -- comm-board HLE ("virtual Z80 board") for OutRunners /
+//  Stadium Cross, plus a point-to-point link between TWO MiSTer boards.
 //
-//  Hardware context (evidenced): the real "System 32 Multi COMM board"
-//  (837-8792) links two cabinets with a point-to-point serial cable, using
-//  connectors CN8 (TX) and CN9 (RX) on the board (see MAME sega/segas32.cpp
-//  comments and the board's own silkscreen). MAME's own s32comm device is a
-//  local HLE stub: it never actually opens a socket or a serial port, it just
-//  answers "link not connected" -- so there is no MAME reference behaviour to
-//  match here. Everything below the register-map layer (CN/FG semantics,
-//  share RAM address map) is therefore a NEW transport we designed to move
-//  bytes over a real cable between two physical MiSTer boards, not a
-//  byte-exact reproduction of Sega's original serial protocol, which is not
-//  in the evidence ledger.
+//  WHAT CHANGED vs the previous version
+//  ------------------------------------
+//  The old module only mirrored CPU writes of the share window to the peer.
+//  The game never got the answers the real comm board (Z80 + EPR-15033)
+//  gives, so it reported a network error no matter what the cable did.
+//  This version emulates, at register level, what MAME's s32comm.cpp
+//  (comm_tick_15033, linktype 15033 = OutRunners / Stadium Cross) does once
+//  per vblank, and moves the data between the two boards over the UART.
 //
-//  Two boards are wired TXD(A) -> RXD(B) and TXD(B) -> RXD(A) through the
-//  MiSTer USER_IO header (3.3V single-ended UART, not RS-422 like the real
-//  cabinet cable -- fine for a short direct cable between two DE10-Nano
-//  boards, but it is not electrically compatible with a genuine 837-8792
-//  cable).
+//  GAME-VISIBLE CONTRACT (from MAME s32comm.cpp, comm_tick_15033)
+//  --------------------------------------------------------------
+//  Share RAM byte index i is at V70 address 0x800000 + 2*i (low byte only).
+//    [0]  node count  (board writes; 0xFF = link failed)
+//    [1]  node id     (board writes)
+//    [2]  node mode   (GAME writes: 0 = slave, 1 = master, 2 = relay)
+//    [3]  ready-to-send (GAME writes != 0; board clears it every tick)
+//    [4]  link status (board writes: 0 = waiting, 1 = online)
+//    [5..0xF]  11 "master additional bytes": master -> slave every tick
+//    [0x10 ..]  RX ring, one 0xE0-byte slot per node: slot (id-1)
+//    [0x710..0x7EF]  TX frame written by the game (0xE0 bytes)
+//  Boot handshake: while the link is not up, if [0..2] == 'V','7','0'
+//  (56 37 30) the board zeroes [3..0x7FF] and writes 'Z','8','0'
+//  (5A 38 30) at [8..0xA].
+//  CN (0x801000) enables the board; vblank is the board's tick.
 //
-//  Modes (OSD-selected):
-//    link_enable = 0  Standalone. Byte-identical to the pre-existing
-//                     disconnected-link HLE: comm_ram is purely local, CN/FG
-//                     behave exactly as before, no bytes ever go on the wire.
-//    link_enable = 1  Network. Every CPU write to the 0x800000-0x800FFF share
-//                     window is also queued and streamed to the peer; every
-//                     valid packet received from the peer is applied to the
-//                     local copy at the same address. Both boards' CPUs keep
-//                     reading only their OWN comm_ram (and their own CN/FG),
-//                     matching MAME's per-board register semantics -- only
-//                     the backing store is now kept in sync over the cable.
+//  WHAT IS (AND IS NOT) HANDLED
+//  ----------------------------
+//  * Exactly two nodes, master (mode 1) + slave (mode 0). Relay (mode 2)
+//    and 3-4 node rings are NOT supported.
+//  * The wire protocol is our own (compact, checksummed); MAME's ring frame
+//    sizes and its optional frame-sync wait are not reproduced.
+//  * Standalone (link_enable = 0) is byte-identical to the old disconnected
+//    behaviour: share RAM is plain local RAM, nothing is answered.
+//  * OSD "Link Role" / "Cabinet ID" are no longer used: role comes from
+//    what the game writes at [2] (service menu).
 //
-//  link_master gives the two boards distinct roles only at link-establishment
-//  time: when the link first comes up, the master pushes a full snapshot of
-//  its comm_ram to the slave (so a board that joins late, or reset later,
-//  converges to the master's state instead of racing it). After that initial
-//  sweep both sides are symmetric: either side's writes propagate to the
-//  other. There is no evidence for what role the real hardware assigns here;
-//  this is our own tie-break rule.
-//
-//  cabinet_id is carried in the heartbeat packet and exposed read-only at
-//  0x801004 (a NEW, non-authentic register -- stock ROMs do not query it).
-//  It exists so a future multi-cabinet extension, or a custom ROM patch,
-//  has somewhere to read the configured id from; today nothing in the
-//  supported game set consumes it.
+//  Wire format (UART 8N1): A5 | TYPE | payload | CHK
+//    TYPE 01 HELLO  payload 1  (sender mode byte; also the heartbeat)
+//    TYPE 02 FD     payload 11 (master -> slave, share [5..0xF])
+//    TYPE 03 DATA   payload 225 (sender id, then 224 bytes of TX frame)
+//    CHK = 5C ^ TYPE ^ all payload bytes
 //============================================================================
 
 module s32_comm_link #(
-    parameter CLK_HZ  = 48_317_307,
-    parameter BAUD    = 1_000_000,
-    // Heartbeat cadence and peer timeout, in clk_sys cycles.
-    parameter HEARTBEAT_CYCLES = CLK_HZ / 60,       // ~1 per video frame
-    parameter LINK_TIMEOUT_CYCLES = CLK_HZ / 8      // ~125 ms of silence -> down
+    parameter CLK_HZ            = 48_317_307,
+    parameter BAUD              = 250_000,
+    // peer silence (in vblank ticks) after which a live link is declared failed
+    parameter LOSS_TICKS        = 180,
+    // a peer HELLO counts as "fresh" for this many ticks
+    parameter HELLO_FRESH_TICKS = 8
 ) (
     input             clk_sys,
     input             rst,
 
-    // CPU side (same signals s32_core.sv already computes for the old stub)
+    // CPU side
     input             cpu_we_ram,     // m_req & m_we & sel_comm_ram & m_be[0]
     input      [10:0] cpu_addr,       // A[11:1]
     input       [7:0] cpu_wdata,
     output reg  [7:0] comm_q,         // registered read data, 1 cycle latency
 
-    // extra non-authentic id readback (0x801004, byte D[7:0])
-    output      [7:0] cabinet_id_q,
+    output      [7:0] cabinet_id_q,   // legacy non-authentic id readback
 
-    // link configuration (OSD)
-    input             link_enable,    // 0 = standalone, 1 = network
-    input             link_master,    // meaningful only at link-up
-    input       [1:0] cabinet_id,
+    // configuration
+    input             link_enable,    // OSD: 0 = standalone, 1 = network
+    input             link_master,    // unused (role comes from the game)
+    input       [1:0] cabinet_id,     // only feeds cabinet_id_q
+
+    // board state from s32_core
+    input             cn_enable,      // CN flip-flop (0x801000 bit 0)
+    input             vbl_start,      // vblank start (pulse or level)
 
     // physical pins (USER_IO)
     output            link_txd,
@@ -79,48 +80,86 @@ module s32_comm_link #(
     output            link_up
 );
 
-// ---------------------------------------------------------------------------
-// Shared RAM storage (unchanged from the original stub: 2048 bytes, byte
-// D[7:0] only, power-up zero, no synchronous reset -- see the s32_core.sv
-// comment this block was moved out of).
-// ---------------------------------------------------------------------------
-reg [7:0] comm_ram [0:2047];
-integer   init_i;
-initial begin
-    for (init_i = 0; init_i < 2048; init_i = init_i + 1)
-        comm_ram[init_i] = 8'h00;
-end
+localparam integer DIV = CLK_HZ / BAUD;
 
 assign cabinet_id_q = {6'h00, cabinet_id};
 
-// ---------------------------------------------------------------------------
-// UART bit engine (8N1, fixed divider). One transmitter, one receiver.
-// ---------------------------------------------------------------------------
-localparam integer DIV = CLK_HZ / BAUD;
+wire act = link_enable && cn_enable;
 
-// ---- TX ----
+// ---------------------------------------------------------------------------
+// Share RAM. ONE write port shared by the V70 (priority) and the HLE engine.
+// Two identical copies are kept so each reader has its own registered read
+// port (plain simple-dual-port RAMs, no true-dual-port inference needed).
+// An HLE write that collides with a V70 write is held and retried; the HLE
+// engine stalls until it has been committed, so no write is ever lost.
+// ---------------------------------------------------------------------------
+reg [7:0] comm_ram   [0:2047];     // read by the V70
+reg [7:0] comm_ram_h [0:2047];     // identical copy, read by the HLE engine
+integer   init_i;
+initial begin
+    for (init_i = 0; init_i < 2048; init_i = init_i + 1) begin
+        comm_ram[init_i]   = 8'h00;
+        comm_ram_h[init_i] = 8'h00;
+    end
+end
+
+reg [10:0] h_addr;                 // HLE read address / write address
+reg  [7:0] h_wdata;
+reg        h_we;                   // one-cycle write request from the engine
+reg  [7:0] h_q;
+reg        h_pend;
+reg [10:0] h_wa;
+reg  [7:0] h_wd;
+initial h_pend = 1'b0;
+
+wire        wr_en = cpu_we_ram | h_pend;
+wire [10:0] wr_a  = cpu_we_ram ? cpu_addr  : h_wa;
+wire  [7:0] wr_d  = cpu_we_ram ? cpu_wdata : h_wd;
+wire        h_busy = h_we | h_pend;
+
+always @(posedge clk_sys) begin
+    if (wr_en) begin
+        comm_ram[wr_a]   <= wr_d;
+        comm_ram_h[wr_a] <= wr_d;
+    end
+    comm_q <= comm_ram[cpu_addr];
+    h_q    <= comm_ram_h[h_addr];
+    if (h_we) begin
+        h_pend <= 1'b1;
+        h_wa   <= h_addr;
+        h_wd   <= h_wdata;
+    end else if (h_pend && !cpu_we_ram) begin
+        h_pend <= 1'b0;
+    end
+end
+
+// ---------------------------------------------------------------------------
+// UART byte engines (8N1, fixed divider)
+// ---------------------------------------------------------------------------
 reg        tx_busy;
 reg  [3:0] tx_bitcnt;
 reg [15:0] tx_div;
-reg  [9:0] tx_shift;   // {stop, data[7:0], start}
+reg  [9:0] tx_shift;
 reg        txd_r;
 assign link_txd = txd_r;
 
 reg        tx_start;
 reg  [7:0] tx_byte;
 
+initial begin txd_r = 1'b1; tx_busy = 1'b0; end
+
 always @(posedge clk_sys) begin
     if (rst || !link_enable) begin
         tx_busy   <= 1'b0;
-        txd_r     <= 1'b1;   // idle mark
+        txd_r     <= 1'b1;
         tx_div    <= 16'd0;
         tx_bitcnt <= 4'd0;
     end else if (tx_start && !tx_busy) begin
-        tx_shift  <= {1'b1, tx_byte, 1'b0}; // stop,data[7:0],start (LSB first out)
+        tx_shift  <= {1'b1, tx_byte, 1'b0};
         tx_busy   <= 1'b1;
         tx_div    <= DIV[15:0];
         tx_bitcnt <= 4'd10;
-        txd_r     <= 1'b0; // start bit immediately
+        txd_r     <= 1'b0;
     end else if (tx_busy) begin
         if (tx_div == 16'd0) begin
             tx_div    <= DIV[15:0] - 16'd1;
@@ -134,31 +173,17 @@ always @(posedge clk_sys) begin
     end
 end
 
-// ---- RX ----
 reg  [1:0] rxd_sync;
 wire       rxd = rxd_sync[1];
+initial rxd_sync = 2'b11;
 always @(posedge clk_sys) rxd_sync <= {rxd_sync[0], link_rxd};
 
-// Three explicit phases, not a single "busy" flag: IDLE (searching for a
-// start edge), DATA (sampling the 8 data bits), STOP (waiting out one more
-// bit period before it is safe to search for a new start bit again).
-//
-// A behavioural-model bug hunt (see PROFILE_CONTRACT.md, this session) found
-// that collapsing STOP into "finalize and immediately go back to searching"
-// is unsafe: the byte is correctly decoded as soon as the 8th data bit's
-// mid-point is sampled, which is *before* that bit's period, let alone the
-// stop bit, actually ends on the wire. Whenever the last data bit (MSB) is
-// 0, the line is still logically low at that instant, and an idle-search
-// state re-arms on the very next cycle -- misreading the tail of the SAME
-// byte as a brand-new start bit and corrupting everything that follows.
-// Waiting through an explicit STOP phase (ignoring its sampled value, same
-// as the TX side does not check for framing errors either) fixes this.
 localparam RX_IDLE = 2'd0, RX_DATA = 2'd1, RX_STOP = 2'd2;
 reg  [1:0] rx_phase;
 reg  [3:0] rx_bitcnt;
 reg [15:0] rx_div;
 reg  [7:0] rx_shift;
-reg        rx_valid;   // one-cycle strobe
+reg        rx_valid;
 reg  [7:0] rx_byte;
 
 always @(posedge clk_sys) begin
@@ -168,14 +193,9 @@ always @(posedge clk_sys) begin
     end else begin
         case (rx_phase)
             RX_IDLE: begin
-                if (!rxd) begin // start bit edge (already synced/registered)
-                    rx_phase <= RX_DATA;
-                    rx_div   <= DIV[15:0] + {1'b0, DIV[15:1]}; // sample mid-bit (1.5*DIV)
-                    // 7, not 8: the finalize branch below (bitcnt==0)
-                    // performs the 8th and last sample itself, so only 7
-                    // preceding decrements are needed. Starting at 8 would
-                    // shift in a 9th (stop-bit) sample, pushing data bit 0
-                    // out of the 8-bit shift register.
+                if (!rxd) begin
+                    rx_phase  <= RX_DATA;
+                    rx_div    <= DIV[15:0] + {1'b0, DIV[15:1]};
                     rx_bitcnt <= 4'd7;
                 end
             end
@@ -187,7 +207,7 @@ always @(posedge clk_sys) begin
                         rx_byte  <= {rxd, rx_shift[7:1]};
                         rx_valid <= 1'b1;
                         rx_phase <= RX_STOP;
-                        rx_div   <= DIV[15:0] - 16'd1; // one more full bit period
+                        rx_div   <= DIV[15:0] - 16'd1;
                     end else begin
                         rx_bitcnt <= rx_bitcnt - 4'd1;
                     end
@@ -199,210 +219,431 @@ always @(posedge clk_sys) begin
                 if (rx_div == 16'd0) rx_phase <= RX_IDLE;
                 else                 rx_div   <= rx_div - 16'd1;
             end
+            default: rx_phase <= RX_IDLE;
         endcase
     end
 end
 
 // ---------------------------------------------------------------------------
-// Dirty-byte TX queue: every local write to the share window, while
-// link_enable, is queued as {addr,data} for the peer.
+// Frame constants
 // ---------------------------------------------------------------------------
-localparam FIFO_DEPTH_BITS = 5; // 32 entries
-reg [18:0] fifo_mem [0:31]; // {addr[10:0], data[7:0]}
-reg [FIFO_DEPTH_BITS-1:0] fifo_wp, fifo_rp;
-wire fifo_empty = (fifo_wp == fifo_rp);
-wire fifo_full  = ((fifo_wp + 1'b1) == fifo_rp);
-// A write that arrives while the queue is full is dropped from the network
-// (the local comm_ram write below still happens): that byte never reaches
-// the peer on its own. Only the master can repair this cheaply, by rearming
-// its post-link-up full-RAM sweep (see the next block) so the whole share
-// window reconverges soon after. A slave-side overflow has no equivalent
-// remedy here and is a known limitation of this non-authentic transport.
-wire fifo_overflow_master = cpu_we_ram && fifo_full && link_master;
+localparam [7:0] F_SYNC  = 8'hA5;
+localparam [7:0] T_HELLO = 8'h01;
+localparam [7:0] T_FD    = 8'h02;
+localparam [7:0] T_DATA  = 8'h03;
+localparam [7:0] CHK0    = 8'h5C;
 
-always @(posedge clk_sys) begin
-    if (rst || !link_enable) begin
-        fifo_wp <= 5'd0;
-    end else if (cpu_we_ram && !fifo_full) begin
-        fifo_mem[fifo_wp] <= {cpu_addr, cpu_wdata};
-        fifo_wp <= fifo_wp + 1'b1;
-    end
+// ---------------------------------------------------------------------------
+// RX frame parser. Frames are staged and only committed when the checksum
+// matches. DATA payload goes to a double-buffered RAM (512 x 8).
+// ---------------------------------------------------------------------------
+localparam RP_SYNC = 2'd0, RP_TYPE = 2'd1, RP_PAY = 2'd2, RP_CHK = 2'd3;
+
+reg  [1:0] rp_state;
+reg  [7:0] rp_type;
+reg  [7:0] rp_chk;
+reg  [7:0] rp_idx;
+reg  [7:0] rp_len_m1;
+reg  [7:0] rx_hello_tmp;
+reg  [7:0] rx_fd_stage [0:15];
+reg  [7:0] rx_fd_buf   [0:15];
+integer    k;
+
+reg        rxd_we;
+reg  [8:0] rxd_waddr;
+reg  [7:0] rxd_wdata;
+
+reg        rx_wsel;       // half currently being written
+reg        rx_data_sel;   // half holding the newest complete frame
+reg  [1:0] rx_data_ev;    // counts DATA frames completed OK
+reg  [1:0] rx_fd_ev;      // counts FD frames completed OK
+reg  [7:0] peer_mode;
+reg  [7:0] hello_age;     // ticks since last valid HELLO (255 = never)
+reg  [8:0] rx_age;        // ticks since last valid frame of any type
+
+wire       tick_go;       // one-cycle strobe: a tick is starting
+
+initial begin
+    rp_state = RP_SYNC; rx_wsel = 1'b0; rx_data_sel = 1'b0;
+    rx_data_ev = 2'd0; rx_fd_ev = 2'd0; peer_mode = 8'hFF;
+    hello_age = 8'hFF; rx_age = 9'd0;
 end
 
-// ---------------------------------------------------------------------------
-// Link-up detection + heartbeat timer.
-// ---------------------------------------------------------------------------
-reg [31:0] silence_cnt;   // since last valid RX packet
-reg [31:0] hb_cnt;        // since last transmitted packet (data or heartbeat)
-wire       heartbeat_due = (hb_cnt >= HEARTBEAT_CYCLES[31:0]);
-assign     link_up = link_enable && (silence_cnt < LINK_TIMEOUT_CYCLES[31:0]);
-
-// ---------------------------------------------------------------------------
-// Master full-sync sweep on link-up.
-//
-// full_sync_active/full_sync_ctr are owned entirely by the TX scheduler
-// always block below (which both arms and advances/clears them): a Verilog
-// reg may only be driven from one always block, and the sweep needs to be
-// armed (on a link-up edge or a FIFO overflow) and advanced (as each sweep
-// byte finishes transmitting) in the same place to avoid a multi-driver
-// conflict. This block only tracks the link_up edge that arms it.
-// ---------------------------------------------------------------------------
-reg        was_up;
 always @(posedge clk_sys) begin
-    if (rst || !link_enable) was_up <= 1'b0;
-    else                     was_up <= link_up;
-end
-wire arm_full_sync = (link_up && !was_up && link_master) || fifo_overflow_master;
-
-// ---------------------------------------------------------------------------
-// Packet parser (RX): SYNC, ADDR_H, ADDR_L, DATA, CHK.
-//   SYNC = 8'hA5 -> data-write packet (applies comm_ram[addr] <= data)
-//   SYNC = 8'h5A -> heartbeat packet (keepalive only, carries cabinet id)
-// ---------------------------------------------------------------------------
-localparam SYNC_DATA = 8'hA5;
-localparam SYNC_HB   = 8'h5A;
-
-reg [2:0] rp_state;
-localparam RP_SYNC=0, RP_AH=1, RP_AL=2, RP_D=3, RP_CHK=4;
-reg [7:0] rp_sync, rp_ah, rp_al, rp_d;
-
-reg        rx_apply;
-reg [10:0] rx_apply_addr;
-reg  [7:0] rx_apply_data;
-
-always @(posedge clk_sys) begin
-    rx_apply <= 1'b0;
+    rxd_we <= 1'b0;
     if (rst || !link_enable) begin
-        rp_state    <= RP_SYNC;
-        silence_cnt <= 32'd0;
+        rp_state   <= RP_SYNC;
+        hello_age  <= 8'hFF;
+        rx_age     <= 9'd0;
+        peer_mode  <= 8'hFF;
+        rx_wsel    <= 1'b0;
+        rx_data_sel<= 1'b0;
+        rx_data_ev <= 2'd0;
+        rx_fd_ev   <= 2'd0;
     end else begin
-        if (silence_cnt < LINK_TIMEOUT_CYCLES[31:0]) silence_cnt <= silence_cnt + 32'd1;
+        if (tick_go) begin
+            if (hello_age != 8'hFF) hello_age <= hello_age + 8'd1;
+            if (rx_age    != 9'h1FF) rx_age   <= rx_age + 9'd1;
+        end
         if (rx_valid) begin
             case (rp_state)
                 RP_SYNC: begin
-                    if (rx_byte == SYNC_DATA || rx_byte == SYNC_HB) begin
-                        rp_sync  <= rx_byte;
-                        rp_state <= RP_AH;
-                    end
-                    // else: not a sync byte, keep scanning (byte dropped)
+                    if (rx_byte == F_SYNC) rp_state <= RP_TYPE;
                 end
-                RP_AH: begin rp_ah <= rx_byte; rp_state <= RP_AL; end
-                RP_AL: begin rp_al <= rx_byte; rp_state <= RP_D;  end
-                RP_D:  begin rp_d  <= rx_byte; rp_state <= RP_CHK; end
+                RP_TYPE: begin
+                    rp_idx  <= 8'd0;
+                    rp_chk  <= CHK0 ^ rx_byte;
+                    rp_type <= rx_byte;
+                    if      (rx_byte == T_HELLO) begin rp_len_m1 <= 8'd0;   rp_state <= RP_PAY; end
+                    else if (rx_byte == T_FD)    begin rp_len_m1 <= 8'd10;  rp_state <= RP_PAY; end
+                    else if (rx_byte == T_DATA)  begin rp_len_m1 <= 8'd224; rp_state <= RP_PAY; end
+                    else                              rp_state <= RP_SYNC;
+                end
+                RP_PAY: begin
+                    rp_chk <= rp_chk ^ rx_byte;
+                    if (rp_type == T_HELLO)     rx_hello_tmp <= rx_byte;
+                    else if (rp_type == T_FD)   rx_fd_stage[rp_idx[3:0]] <= rx_byte;
+                    else begin
+                        rxd_we    <= 1'b1;
+                        rxd_waddr <= {rx_wsel, rp_idx};
+                        rxd_wdata <= rx_byte;
+                    end
+                    if (rp_idx == rp_len_m1) rp_state <= RP_CHK;
+                    else                     rp_idx   <= rp_idx + 8'd1;
+                end
                 RP_CHK: begin
-                    if (rx_byte == (rp_sync ^ rp_ah ^ rp_al ^ rp_d)) begin
-                        // checksum OK
-                        silence_cnt <= 32'd0;
-                        if (rp_sync == SYNC_DATA) begin
-                            rx_apply      <= 1'b1;
-                            rx_apply_addr <= {rp_ah[2:0], rp_al};
-                            rx_apply_data <= rp_d;
+                    rp_state <= RP_SYNC;
+                    if (rx_byte == rp_chk) begin
+                        rx_age <= 9'd0;
+                        if (rp_type == T_HELLO) begin
+                            peer_mode <= rx_hello_tmp;
+                            hello_age <= 8'd0;
+                        end else if (rp_type == T_FD) begin
+                            for (k = 0; k < 16; k = k + 1)
+                                rx_fd_buf[k] <= rx_fd_stage[k];
+                            rx_fd_ev <= rx_fd_ev + 2'd1;
+                        end else begin
+                            rx_data_sel <= rx_wsel;
+                            rx_wsel     <= ~rx_wsel;
+                            rx_data_ev  <= rx_data_ev + 2'd1;
                         end
                     end
-                    // whether checksum passed or not, go back to scanning
-                    rp_state <= RP_SYNC;
                 end
             endcase
         end
     end
 end
 
-// ---------------------------------------------------------------------------
-// comm_ram write arbitration: local CPU write wins over a same-cycle peer
-// update; read data keeps the original 1-cycle-latency semantics.
-// ---------------------------------------------------------------------------
+reg [8:0] rxm_addr;
+reg [7:0] rxm_q;
+reg [7:0] rxd_mem [0:511];
 always @(posedge clk_sys) begin
-    if (cpu_we_ram)
-        comm_ram[cpu_addr] <= cpu_wdata;
-    else if (rx_apply)
-        comm_ram[rx_apply_addr] <= rx_apply_data;
-    comm_q <= comm_ram[cpu_addr];
+    if (rxd_we) rxd_mem[rxd_waddr] <= rxd_wdata;
+    rxm_q <= rxd_mem[rxm_addr];
 end
 
 // ---------------------------------------------------------------------------
-// TX scheduler: dirty FIFO first (keeps live gameplay latency low), then the
-// master's post-link-up full sweep, then a heartbeat if nothing else is due.
+// TX frame sender. The tick engine prepares buffers and toggles req_*;
+// the sender streams the frame and toggles ack_* when the CHK is queued.
 // ---------------------------------------------------------------------------
-reg [7:0] tx_sync_r, tx_ah_r, tx_al_r, tx_d_r;
-reg       tx_is_fullsync; // latched at TP_IDLE: was THIS packet a full-sync
-                          // byte? (fifo_empty can change during the ~50-bit
-                          // transmission window, so re-testing it in TP_WAIT
-                          // would misclassify the packet and stall the sweep)
-reg [2:0] tx_pk_state;
-localparam TP_IDLE=0, TP_SYNC=1, TP_AH=2, TP_AL=3, TP_D=4, TP_CHK=5, TP_WAIT=6;
-reg        full_sync_active;
-reg [10:0] full_sync_ctr;
+localparam SN_IDLE = 3'd0, SN_SYNC = 3'd1, SN_TYPE = 3'd2,
+           SN_FETCH = 3'd3, SN_PAY = 3'd4, SN_CHK = 3'd5;
+localparam [1:0] K_HELLO = 2'd0, K_FD = 2'd1, K_DATA = 2'd2;
+
+reg  [2:0] sn_state;
+reg  [1:0] sn_kind;
+reg  [7:0] sn_idx;
+reg  [7:0] sn_len_m1;
+reg  [7:0] sn_chk;
+
+reg        req_hello, req_fd, req_data;   // driven by the tick engine
+reg        ack_hello, ack_fd, ack_data;   // driven by the sender
+wire hello_pending = req_hello ^ ack_hello;
+wire fd_pending    = req_fd    ^ ack_fd;
+wire data_pending  = req_data  ^ ack_data;
+
+reg  [7:0] hello_byte;
+reg  [7:0] fd_buf [0:15];
+
+reg        db_we;
+reg  [7:0] db_waddr;
+reg  [7:0] db_wdata;
+reg  [7:0] dbuf_q;
+reg  [7:0] data_buf [0:255];
+always @(posedge clk_sys) begin
+    if (db_we) data_buf[db_waddr] <= db_wdata;
+    dbuf_q <= data_buf[sn_idx];
+end
+
+wire [7:0] pay_byte = (sn_kind == K_HELLO) ? hello_byte :
+                      (sn_kind == K_FD)    ? fd_buf[sn_idx[3:0]] : dbuf_q;
+wire [7:0] type_byte = (sn_kind == K_HELLO) ? T_HELLO :
+                       (sn_kind == K_FD)    ? T_FD    : T_DATA;
+
+initial begin
+    sn_state = SN_IDLE;
+    req_hello = 1'b0; req_fd = 1'b0; req_data = 1'b0;
+    ack_hello = 1'b0; ack_fd = 1'b0; ack_data = 1'b0;
+    tx_start = 1'b0;
+end
 
 always @(posedge clk_sys) begin
     tx_start <= 1'b0;
     if (rst || !link_enable) begin
-        tx_pk_state <= TP_IDLE;
-        fifo_rp     <= 5'd0;
-        hb_cnt      <= 32'd0;
-        full_sync_active <= 1'b0;
-        full_sync_ctr    <= 11'd0;
+        sn_state  <= SN_IDLE;
+        ack_hello <= 1'b0;
+        ack_fd    <= 1'b0;
+        ack_data  <= 1'b0;
     end else begin
-        if (hb_cnt < HEARTBEAT_CYCLES[31:0]) hb_cnt <= hb_cnt + 32'd1;
-        // Arming can land on any cycle, independent of tx_pk_state; a
-        // same-cycle collision with the TP_WAIT clear/advance below (an
-        // exceedingly rare coincidence -- arming needs a fresh link-up edge
-        // or a FIFO overflow, TP_WAIT's own write needs a sweep byte to have
-        // just finished transmitting) resolves in program order, i.e. this
-        // re-arm loses to that TP_WAIT write; the next arm_full_sync pulse
-        // (overflow keeps re-asserting every further dropped write) recovers
-        // it, so nothing is lost permanently.
-        if (arm_full_sync) begin
-            full_sync_active <= 1'b1;
-            full_sync_ctr    <= 11'd0;
-        end
-        case (tx_pk_state)
-            TP_IDLE: begin
-                tx_is_fullsync <= 1'b0;
-                if (!fifo_empty) begin
-                    tx_sync_r <= SYNC_DATA;
-                    tx_ah_r   <= {5'h00, fifo_mem[fifo_rp][18:16]};
-                    tx_al_r   <= fifo_mem[fifo_rp][15:8];
-                    tx_d_r    <= fifo_mem[fifo_rp][7:0];
-                    fifo_rp   <= fifo_rp + 1'b1;
-                    tx_pk_state <= TP_SYNC;
-                end else if (full_sync_active) begin
-                    tx_sync_r <= SYNC_DATA;
-                    tx_ah_r   <= {5'h00, full_sync_ctr[10:8]};
-                    tx_al_r   <= full_sync_ctr[7:0];
-                    tx_d_r    <= comm_ram[full_sync_ctr];
-                    tx_is_fullsync <= 1'b1;
-                    tx_pk_state <= TP_SYNC;
-                end else if (heartbeat_due) begin
-                    tx_sync_r <= SYNC_HB;
-                    tx_ah_r   <= 8'h00;
-                    tx_al_r   <= 8'h00;
-                    tx_d_r    <= {6'h00, cabinet_id};
-                    tx_pk_state <= TP_SYNC;
+        case (sn_state)
+            SN_IDLE: begin
+                sn_idx <= 8'd0;
+                if (!tx_busy && !tx_start) begin
+                    if (hello_pending) begin
+                        sn_kind <= K_HELLO; sn_len_m1 <= 8'd0;   sn_state <= SN_SYNC;
+                    end else if (fd_pending) begin
+                        sn_kind <= K_FD;    sn_len_m1 <= 8'd10;  sn_state <= SN_SYNC;
+                    end else if (data_pending) begin
+                        sn_kind <= K_DATA;  sn_len_m1 <= 8'd224; sn_state <= SN_SYNC;
+                    end
                 end
             end
-            TP_SYNC: if (!tx_busy) begin tx_byte <= tx_sync_r; tx_start <= 1'b1; tx_pk_state <= TP_AH; end
-            TP_AH:   if (!tx_busy && !tx_start) begin tx_byte <= tx_ah_r; tx_start <= 1'b1; tx_pk_state <= TP_AL; end
-            TP_AL:   if (!tx_busy && !tx_start) begin tx_byte <= tx_al_r; tx_start <= 1'b1; tx_pk_state <= TP_D; end
-            TP_D:    if (!tx_busy && !tx_start) begin tx_byte <= tx_d_r;  tx_start <= 1'b1; tx_pk_state <= TP_CHK; end
-            TP_CHK:  if (!tx_busy && !tx_start) begin
-                        tx_byte  <= tx_sync_r ^ tx_ah_r ^ tx_al_r ^ tx_d_r;
-                        tx_start <= 1'b1;
-                        tx_pk_state <= TP_WAIT;
-                     end
-            TP_WAIT: if (!tx_busy && !tx_start) begin
-                        hb_cnt <= 32'd0;
-                        if (tx_is_fullsync) begin
-                            if (full_sync_ctr == 11'd2047) begin
-                                full_sync_active <= 1'b0;
-                                full_sync_ctr    <= 11'd0;
-                            end else begin
-                                full_sync_ctr <= full_sync_ctr + 1'b1;
-                            end
-                        end
-                        tx_pk_state <= TP_IDLE;
-                     end
+            SN_SYNC: if (!tx_busy && !tx_start) begin
+                tx_byte  <= F_SYNC;
+                tx_start <= 1'b1;
+                sn_state <= SN_TYPE;
+            end
+            SN_TYPE: if (!tx_busy && !tx_start) begin
+                tx_byte  <= type_byte;
+                sn_chk   <= CHK0 ^ type_byte;
+                tx_start <= 1'b1;
+                sn_state <= SN_FETCH;
+            end
+            SN_FETCH: sn_state <= SN_PAY;       // one cycle for dbuf_q
+            SN_PAY: if (!tx_busy && !tx_start) begin
+                tx_byte  <= pay_byte;
+                sn_chk   <= sn_chk ^ pay_byte;
+                tx_start <= 1'b1;
+                if (sn_idx == sn_len_m1) sn_state <= SN_CHK;
+                else begin
+                    sn_idx   <= sn_idx + 8'd1;
+                    sn_state <= SN_FETCH;
+                end
+            end
+            SN_CHK: if (!tx_busy && !tx_start) begin
+                tx_byte  <= sn_chk;
+                tx_start <= 1'b1;
+                if      (sn_kind == K_HELLO) ack_hello <= req_hello;
+                else if (sn_kind == K_FD)    ack_fd    <= req_fd;
+                else                         ack_data  <= req_data;
+                sn_state <= SN_IDLE;
+            end
+            default: sn_state <= SN_IDLE;
         endcase
     end
+end
+
+// ---------------------------------------------------------------------------
+// Tick engine: what MAME does in comm_tick_15033() once per vblank.
+// ---------------------------------------------------------------------------
+localparam [5:0]
+    TF_IDLE = 6'd0,  TF_W   = 6'd1,
+    TF_P1   = 6'd2,  TF_P2  = 6'd3,  TF_P3  = 6'd4,  TF_CLR = 6'd5,
+    TF_Z0   = 6'd6,  TF_Z1  = 6'd7,  TF_Z2  = 6'd8,  TF_P4  = 6'd9,
+    TF_P5   = 6'd10, TF_L0  = 6'd11, TF_L1  = 6'd12, TF_L2  = 6'd13,
+    TF_A0   = 6'd14, TF_RX0 = 6'd15, TF_RX1 = 6'd16, TF_RX2 = 6'd17,
+    TF_RX3  = 6'd18, TF_A3  = 6'd19, TF_FD0 = 6'd20, TF_A4  = 6'd21,
+    TF_A5   = 6'd22, TF_T0  = 6'd23, TF_T1  = 6'd24, TF_T2  = 6'd25,
+    TF_A7   = 6'd26, TF_F0  = 6'd27, TF_F1  = 6'd28, TF_A9  = 6'd29,
+    TF_A10  = 6'd30;
+
+reg  [5:0] tf, tf_ret;
+reg  [1:0] alive;        // 0 = not up, 1 = up, 2 = failed
+reg  [1:0] my_id;        // 1 = master, 2 = slave
+reg        my_master;
+reg        sig_hit;
+reg  [7:0] s0, s1, s2;
+reg [10:0] ctr;
+reg        tick_req;
+reg        vbl_q, cn_q;
+reg  [1:0] rx_data_ack, rx_fd_ack;
+reg        rx_sel_l;
+
+wire rx_data_pending = (rx_data_ev != rx_data_ack);
+wire rx_fd_pending   = (rx_fd_ev   != rx_fd_ack);
+
+wire [10:0] peer_base = (my_id == 2'd1) ? 11'h0F0 : 11'h010;
+wire [10:0] own_base  = (my_id == 2'd1) ? 11'h010 : 11'h0F0;
+wire  [7:0] peer_id8  = (my_id == 2'd1) ? 8'd2 : 8'd1;
+
+assign tick_go = (tf == TF_IDLE) && tick_req && act && !h_busy;
+assign link_up = act && (alive == 2'd1);
+
+initial begin
+    tf = TF_IDLE; alive = 2'd0; my_id = 2'd0; my_master = 1'b0;
+    tick_req = 1'b0; rx_data_ack = 2'd0; rx_fd_ack = 2'd0;
+    vbl_q = 1'b0; cn_q = 1'b0; h_we = 1'b0; db_we = 1'b0;
+end
+
+always @(posedge clk_sys) begin
+    h_we  <= 1'b0;
+    db_we <= 1'b0;
+    vbl_q <= vbl_start;
+    cn_q  <= cn_enable;
+
+    if (rst || !link_enable) begin
+        tf <= TF_IDLE; alive <= 2'd0; my_id <= 2'd0; my_master <= 1'b0;
+        tick_req <= 1'b0;
+        req_hello <= 1'b0; req_fd <= 1'b0; req_data <= 1'b0;
+        rx_data_ack <= 2'd0; rx_fd_ack <= 2'd0;
+    end else if (!cn_enable) begin
+        // board disabled by the game: forget the link, drop pending work
+        tf <= TF_IDLE; alive <= 2'd0; my_id <= 2'd0; my_master <= 1'b0;
+        tick_req <= 1'b0;
+        req_hello <= ack_hello; req_fd <= ack_fd; req_data <= ack_data;
+        rx_data_ack <= rx_data_ev; rx_fd_ack <= rx_fd_ev;
+    end else if (!h_busy) begin
+        case (tf)
+            TF_IDLE: begin
+                if (tick_req) begin
+                    tick_req <= 1'b0;
+                    if (alive == 2'd2) begin
+                        h_addr <= 11'd0; h_wdata <= 8'hFF; h_we <= 1'b1;   // link failed
+                    end else if (alive == 2'd0) begin
+                        sig_hit <= 1'b0;
+                        h_addr  <= 11'd0;
+                        tf <= TF_W; tf_ret <= TF_P1;
+                    end else begin
+                        tf <= TF_A0;
+                    end
+                end
+            end
+
+            TF_W: tf <= tf_ret;     // one wait cycle for the registered RAM read
+
+            // ---- link not yet established ----
+            TF_P1: begin s0 <= h_q; h_addr <= 11'd1; tf <= TF_W; tf_ret <= TF_P2; end
+            TF_P2: begin s1 <= h_q; h_addr <= 11'd2; tf <= TF_W; tf_ret <= TF_P3; end
+            TF_P3: begin
+                s2 <= h_q;
+                if (s0 == 8'h56 && s1 == 8'h37 && h_q == 8'h30) begin
+                    sig_hit <= 1'b1; ctr <= 11'd3; tf <= TF_CLR;       // "V70" seen
+                end else tf <= TF_P4;
+            end
+            TF_CLR: begin
+                h_addr <= ctr; h_wdata <= 8'h00; h_we <= 1'b1;
+                ctr <= ctr + 11'd1;
+                if (ctr == 11'h7FF) tf <= TF_Z0;
+            end
+            TF_Z0: begin h_addr <= 11'd8;  h_wdata <= 8'h5A; h_we <= 1'b1; tf <= TF_Z1; end
+            TF_Z1: begin h_addr <= 11'd9;  h_wdata <= 8'h38; h_we <= 1'b1; tf <= TF_Z2; end
+            TF_Z2: begin h_addr <= 11'd10; h_wdata <= 8'h30; h_we <= 1'b1; tf <= TF_P4; end
+            TF_P4: begin                                               // status = waiting
+                h_addr <= 11'd4; h_wdata <= 8'h00; h_we <= 1'b1;
+                tf <= sig_hit ? TF_IDLE : TF_P5;
+            end
+            TF_P5: begin
+                if (s2 == 8'h00 || s2 == 8'h01) begin
+                    hello_byte <= s2;
+                    if (!hello_pending) req_hello <= ~req_hello;
+                    if (hello_age <= HELLO_FRESH_TICKS &&
+                        peer_mode == (s2[0] ? 8'h00 : 8'h01)) begin
+                        alive     <= 2'd1;
+                        my_master <= s2[0];
+                        my_id     <= s2[0] ? 2'd1 : 2'd2;
+                        tf        <= TF_L0;
+                    end else tf <= TF_IDLE;
+                end else tf <= TF_IDLE;
+            end
+            TF_L0: begin h_addr <= 11'd4; h_wdata <= 8'h01;           h_we <= 1'b1; tf <= TF_L1; end
+            TF_L1: begin h_addr <= 11'd1; h_wdata <= {6'b0, my_id};   h_we <= 1'b1; tf <= TF_L2; end
+            TF_L2: begin h_addr <= 11'd0; h_wdata <= 8'h02;           h_we <= 1'b1; tf <= TF_IDLE; end
+
+            // ---- link established ----
+            TF_A0: begin
+                if (rx_age > LOSS_TICKS) begin
+                    alive <= 2'd2;
+                    h_addr <= 11'd0; h_wdata <= 8'hFF; h_we <= 1'b1;
+                    tf <= TF_IDLE;
+                end else if (rx_data_pending) begin
+                    rx_sel_l <= rx_data_sel;
+                    rxm_addr <= {rx_data_sel, 8'd0};
+                    tf <= TF_RX0;
+                end else tf <= TF_A3;
+            end
+            TF_RX0: tf <= TF_RX1;
+            TF_RX1: begin
+                rx_data_ack <= rx_data_ev;
+                if (rxm_q == peer_id8) begin
+                    ctr <= 11'd0;
+                    rxm_addr <= {rx_sel_l, 8'd1};
+                    tf <= TF_RX2;
+                end else tf <= TF_A3;
+            end
+            TF_RX2: tf <= TF_RX3;
+            TF_RX3: begin
+                h_addr <= peer_base + ctr; h_wdata <= rxm_q; h_we <= 1'b1;
+                ctr <= ctr + 11'd1;
+                if (ctr == 11'd223) tf <= TF_A3;
+                else begin
+                    rxm_addr <= {rx_sel_l, 8'd0} + ctr[8:0] + 9'd2;
+                    tf <= TF_RX2;
+                end
+            end
+            TF_A3: begin
+                if (!my_master && rx_fd_pending) begin
+                    rx_fd_ack <= rx_fd_ev; ctr <= 11'd0; tf <= TF_FD0;
+                end else tf <= TF_A4;
+            end
+            TF_FD0: begin
+                h_addr <= 11'd5 + ctr; h_wdata <= rx_fd_buf[ctr[3:0]]; h_we <= 1'b1;
+                ctr <= ctr + 11'd1;
+                if (ctr == 11'd10) tf <= TF_A4;
+            end
+            TF_A4: begin h_addr <= 11'd3; tf <= TF_W; tf_ret <= TF_A5; end
+            TF_A5: begin
+                if (h_q != 8'h00 && !data_pending) begin ctr <= 11'd0; tf <= TF_T0; end
+                else tf <= TF_A7;
+            end
+            TF_T0: begin h_addr <= 11'h710 + ctr; tf <= TF_W; tf_ret <= TF_T1; end
+            TF_T1: begin
+                db_waddr <= ctr[7:0] + 8'd1; db_wdata <= h_q; db_we <= 1'b1;
+                h_addr <= own_base + ctr; h_wdata <= h_q; h_we <= 1'b1;   // own copy in RX ring
+                ctr <= ctr + 11'd1;
+                if (ctr == 11'd223) tf <= TF_T2; else tf <= TF_T0;
+            end
+            TF_T2: begin
+                db_waddr <= 8'd0; db_wdata <= {6'b0, my_id}; db_we <= 1'b1;
+                req_data <= ~req_data;
+                tf <= TF_A7;
+            end
+            TF_A7: begin
+                if (my_master && !fd_pending) begin ctr <= 11'd0; tf <= TF_F0; end
+                else tf <= TF_A9;
+            end
+            TF_F0: begin h_addr <= 11'd5 + ctr; tf <= TF_W; tf_ret <= TF_F1; end
+            TF_F1: begin
+                fd_buf[ctr[3:0]] <= h_q;
+                ctr <= ctr + 11'd1;
+                if (ctr == 11'd10) begin req_fd <= ~req_fd; tf <= TF_A9; end
+                else tf <= TF_F0;
+            end
+            TF_A9: begin
+                hello_byte <= {7'b0, my_master};
+                if (!hello_pending) req_hello <= ~req_hello;
+                tf <= TF_A10;
+            end
+            TF_A10: begin                                            // clear ready-to-send
+                h_addr <= 11'd3; h_wdata <= 8'h00; h_we <= 1'b1;
+                tf <= TF_IDLE;
+            end
+            default: tf <= TF_IDLE;
+        endcase
+    end
+
+    // tick sources (set last so a simultaneous clear in TF_IDLE cannot hide a request)
+    if (act && vbl_start && !vbl_q) tick_req <= 1'b1;
+    if (act && cn_enable && !cn_q)  tick_req <= 1'b1;
 end
 
 endmodule
