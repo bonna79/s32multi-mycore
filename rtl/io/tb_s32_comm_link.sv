@@ -42,7 +42,7 @@ module tb_s32_comm_link;
         .clk_sys(clk), .rst(rst),
         .cpu_we_ram(a_we), .cpu_addr(a_addr), .cpu_wdata(a_wd), .comm_q(a_q),
         .cabinet_id_q(), .link_enable(a_en), .link_master(1'b0), .cabinet_id(2'b00),
-        .baud_sel(2'd0), .link_test(a_test), .peer_seen(a_seen),
+        .baud_sel(2'd0), .link_test(a_test), .peer_seen(a_seen), .dbg_blink(),
         .cn_enable(a_cn), .vbl_start(a_vbl),
         .link_txd(a_tx), .link_rxd(b_tx), .link_up(a_up));
 
@@ -50,7 +50,7 @@ module tb_s32_comm_link;
         .clk_sys(clk), .rst(rst),
         .cpu_we_ram(b_we), .cpu_addr(b_addr), .cpu_wdata(b_wd), .comm_q(b_q),
         .cabinet_id_q(), .link_enable(b_en), .link_master(1'b0), .cabinet_id(2'b00),
-        .baud_sel(2'd0), .link_test(b_test), .peer_seen(b_seen),
+        .baud_sel(2'd0), .link_test(b_test), .peer_seen(b_seen), .dbg_blink(),
         .cn_enable(b_cn), .vbl_start(b_vbl),
         .link_txd(b_tx), .link_rxd(a_tx), .link_up(b_up));
 
@@ -152,6 +152,8 @@ module tb_s32_comm_link;
         check("B id",     dutB.comm_ram[1], 8'h02);
         check("B status", dutB.comm_ram[4], 8'h01);
         if (!a_up || !b_up) begin errors = errors + 1; $display("FAIL  link_up flags a=%b b=%b", a_up, b_up); end
+        check("A stage after link up", {5'b0, dutA.stage_max}, 8'd5);
+        check("B stage after link up", {5'b0, dutB.stage_max}, 8'd5);
 
         // ---- 3a. A -> B frame ----
         $display("-- A->B frame");
