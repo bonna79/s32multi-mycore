@@ -150,10 +150,8 @@ assign HDMI_BLACKOUT = 0;
 assign HDMI_BOB_DEINT = 0;
 assign AUDIO_S = 1;
 assign AUDIO_MIX = 0;
-// Lit until the index-0 ROM stream has fully drained to SDRAM.
-assign LED_USER = ~rom_loaded;
+// LED_USER and LED_DISK are assigned next to the comm-link wires below.
 assign LED_POWER = 0;
-assign LED_DISK = 0;
 assign BUTTONS = 0;
 
 //////////////////////////////////   CONF   ///////////////////////////////////
@@ -195,6 +193,8 @@ localparam CONF_STR = {
     "O[8],Cabinet Link,Standalone,Network;",
     "O[30],Link Role,Slave,Master;",
     "O[32:31],Cabinet ID,0,1,2,3;",
+    "O[34:33],Link Baud,250k,115k,57.6k,500k;",
+    "O[36],Link Test,Off,On;",
     "-;",
     "R[0],Reset;",
     // B1/B2 = shift up/down, B3 = DJ/music, B4/B5 = track <</>>,
@@ -505,9 +505,14 @@ wire [7:0] p2a_dig = p_dig(joystick_1);
 // of one board reaches IO[5] (pin 5) of the other, in both directions; the
 // same IO[2]/IO[5] pair carries RTS/CTS in the PSX link-cable core, whose
 // 45-minute run on this cable validated the path. Other bits stay idle-high.
-wire comm_link_txd, comm_link_up;
+wire comm_link_txd, comm_link_up, comm_peer_seen;
 assign USER_OUT = {4'b1111, comm_link_txd, 2'b11};
 wire comm_link_rxd = USER_IN[5];
+// LED_USER: lit until the index-0 ROM stream has fully drained to SDRAM, and
+// while the comm link is up. LED_DISK (OR'd with the HPS disk activity): a
+// valid frame from the other MiSTer arrived in the last ~0.7 s.
+assign LED_USER = ~rom_loaded | comm_link_up;
+assign LED_DISK = {1'b0, comm_peer_seen};
 
 wire [7:0] core_p1a = p1a_dig;
 // OutRunners routes PLAYER 1's music keys through the P2_A port (MAME
@@ -706,6 +711,8 @@ s32_core core (
     .comm_cabinet_id(status[32:31]),
     .comm_link_txd(comm_link_txd), .comm_link_rxd(comm_link_rxd),
     .comm_link_up(comm_link_up),
+    .comm_link_test(status[36]), .comm_link_baud(status[34:33]),
+    .comm_peer_seen(comm_peer_seen),
     .in_p1a(core_p1a), .in_p2a(core_p2a),
     .in_portc(portc), .in_svc12(svc12), .in_svc34(svc34),
     // Second cockpit (Player 2, joystick_1): P1_B bits 1:0 = P2 shift
