@@ -496,13 +496,18 @@ wire [7:0] p2a_dig = p_dig(joystick_1);
 // are hardcoded 0 in active_board above, so every branch that used to key off
 // them is gone too.
 //
-// USER_IO bit 0 now carries the NEW (non-authentic) comm-board physical link
-// (see rtl/io/s32_comm_link.sv): a plain 3.3V UART, TXD out on USER_OUT[0],
-// RXD in on USER_IN[0], meant for a direct cable between two DE10-Nano USER_IO
-// headers. Bits 1-6 remain unused/idle-high.
+// USER_IO carries the NEW (non-authentic) comm-board physical link
+// (see rtl/io/s32_comm_link.sv): a plain 3.3V UART, TXD out on IO[2] and RXD
+// in on IO[5], identical on both MiSTers. The pair is open-drain: a '1' on
+// USER_OUT releases the pin, so IO[5] is left released and only reads.
+// Cable: a USB 3.0 Type-A <-> Type-A cable with VBUS (pin 1) not connected.
+// It crosses the two SuperSpeed pairs (pins 5<->8, 6<->9), so IO[2] (pin 8)
+// of one board reaches IO[5] (pin 5) of the other, in both directions; the
+// same IO[2]/IO[5] pair carries RTS/CTS in the PSX link-cable core, whose
+// 45-minute run on this cable validated the path. Other bits stay idle-high.
 wire comm_link_txd, comm_link_up;
-assign USER_OUT = {5'h1f, 1'b1, comm_link_txd};
-wire comm_link_rxd = USER_IN[1];
+assign USER_OUT = {4'b1111, comm_link_txd, 2'b11};
+wire comm_link_rxd = USER_IN[5];
 
 wire [7:0] core_p1a = p1a_dig;
 // OutRunners routes PLAYER 1's music keys through the P2_A port (MAME
