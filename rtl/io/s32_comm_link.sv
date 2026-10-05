@@ -68,6 +68,8 @@ module s32_comm_link #(
     input             link_enable,    // OSD: 0 = standalone, 1 = network
     input             link_master,    // unused (role comes from the game)
     input       [1:0] cabinet_id,     // only feeds cabinet_id_q
+    input       [1:0] baud_sel,       // 0: BAUD parameter, 1: 115200, 2: 57600, 3: 500000
+    input             link_test,      // diagnostics: run the link engine without a game
 
     // board state from s32_core
     input             cn_enable,      // CN flip-flop (0x801000 bit 0)
@@ -77,14 +79,32 @@ module s32_comm_link #(
     output            link_txd,
     input             link_rxd,
 
-    output            link_up
+    output            link_up,
+    output            peer_seen       // a valid frame arrived in the last ~0.7 s
 );
 
-localparam integer DIV = CLK_HZ / BAUD;
+localparam integer DIV0 = CLK_HZ / BAUD;      // default: the BAUD parameter
+localparam integer DIV1 = CLK_HZ / 115200;
+localparam integer DIV2 = CLK_HZ / 57600;
+localparam integer DIV3 = CLK_HZ / 500000;
+reg [15:0] div_r;
+initial div_r = DIV0[15:0];
+always @(posedge clk_sys) begin
+    case (baud_sel)
+        2'd0:    div_r <= DIV0[15:0];
+        2'd1:    div_r <= DIV1[15:0];
+        2'd2:    div_r <= DIV2[15:0];
+        default: div_r <= DIV3[15:0];
+    endcase
+end
 
 assign cabinet_id_q = {6'h00, cabinet_id};
 
-wire act = link_enable && cn_enable;
+// link_test forces the engine on even when the game has not enabled the
+// board (CN = 0): both MiSTers then exchange HELLO frames every vblank, so the
+// cable, pins and baud rate can be checked with no game protocol involved.
+wire cn_eff = cn_enable | link_test;
+wire act = link_enable && cn_eff;
 
 // ---------------------------------------------------------------------------
 // Share RAM. ONE write port shared by the V70 (priority) and the HLE engine.
@@ -157,12 +177,12 @@ always @(posedge clk_sys) begin
     end else if (tx_start && !tx_busy) begin
         tx_shift  <= {1'b1, tx_byte, 1'b0};
         tx_busy   <= 1'b1;
-        tx_div    <= DIV[15:0];
+        tx_div    <= div_r;
         tx_bitcnt <= 4'd10;
         txd_r     <= 1'b0;
     end else if (tx_busy) begin
         if (tx_div == 16'd0) begin
-            tx_div    <= DIV[15:0] - 16'd1;
+            tx_div    <= div_r - 16'd1;
             tx_shift  <= {1'b1, tx_shift[9:1]};
             txd_r     <= tx_shift[1];
             tx_bitcnt <= tx_bitcnt - 4'd1;
@@ -195,19 +215,19 @@ always @(posedge clk_sys) begin
             RX_IDLE: begin
                 if (!rxd) begin
                     rx_phase  <= RX_DATA;
-                    rx_div    <= DIV[15:0] + {1'b0, DIV[15:1]};
+                    rx_div    <= div_r + {1'b0, div_r[15:1]};
                     rx_bitcnt <= 4'd7;
                 end
             end
             RX_DATA: begin
                 if (rx_div == 16'd0) begin
-                    rx_div   <= DIV[15:0] - 16'd1;
+                    rx_div   <= div_r - 16'd1;
                     rx_shift <= {rxd, rx_shift[7:1]};
                     if (rx_bitcnt == 4'd0) begin
                         rx_byte  <= {rxd, rx_shift[7:1]};
                         rx_valid <= 1'b1;
                         rx_phase <= RX_STOP;
-                        rx_div   <= DIV[15:0] - 16'd1;
+                        rx_div   <= div_r - 16'd1;
                     end else begin
                         rx_bitcnt <= rx_bitcnt - 4'd1;
                     end
@@ -260,18 +280,21 @@ reg  [1:0] rx_fd_ev;      // counts FD frames completed OK
 reg  [7:0] peer_mode;
 reg  [7:0] hello_age;     // ticks since last valid HELLO (255 = never)
 reg  [8:0] rx_age;        // ticks since last valid frame of any type
+reg [24:0] seen_cnt;      // hold-off for the peer_seen indicator (about 0.7 s)
 
 wire       tick_go;       // one-cycle strobe: a tick is starting
 
 initial begin
     rp_state = RP_SYNC; rx_wsel = 1'b0; rx_data_sel = 1'b0;
     rx_data_ev = 2'd0; rx_fd_ev = 2'd0; peer_mode = 8'hFF;
-    hello_age = 8'hFF; rx_age = 9'd0;
+    hello_age = 8'hFF; rx_age = 9'd0; seen_cnt = 25'd0;
 end
 
 always @(posedge clk_sys) begin
     rxd_we <= 1'b0;
+    if (seen_cnt != 25'd0) seen_cnt <= seen_cnt - 25'd1;
     if (rst || !link_enable) begin
+        seen_cnt   <= 25'd0;
         rp_state   <= RP_SYNC;
         hello_age  <= 8'hFF;
         rx_age     <= 9'd0;
@@ -314,7 +337,8 @@ always @(posedge clk_sys) begin
                 RP_CHK: begin
                     rp_state <= RP_SYNC;
                     if (rx_byte == rp_chk) begin
-                        rx_age <= 9'd0;
+                        rx_age   <= 9'd0;
+                        seen_cnt <= 25'h1FFFFFF;
                         if (rp_type == T_HELLO) begin
                             peer_mode <= rx_hello_tmp;
                             hello_age <= 8'd0;
@@ -478,6 +502,7 @@ wire  [7:0] peer_id8  = (my_id == 2'd1) ? 8'd2 : 8'd1;
 
 assign tick_go = (tf == TF_IDLE) && tick_req && act && !h_busy;
 assign link_up = act && (alive == 2'd1);
+assign peer_seen = link_enable && (seen_cnt != 25'd0);
 
 initial begin
     tf = TF_IDLE; alive = 2'd0; my_id = 2'd0; my_master = 1'b0;
@@ -489,14 +514,14 @@ always @(posedge clk_sys) begin
     h_we  <= 1'b0;
     db_we <= 1'b0;
     vbl_q <= vbl_start;
-    cn_q  <= cn_enable;
+    cn_q  <= cn_eff;
 
     if (rst || !link_enable) begin
         tf <= TF_IDLE; alive <= 2'd0; my_id <= 2'd0; my_master <= 1'b0;
         tick_req <= 1'b0;
         req_hello <= 1'b0; req_fd <= 1'b0; req_data <= 1'b0;
         rx_data_ack <= 2'd0; rx_fd_ack <= 2'd0;
-    end else if (!cn_enable) begin
+    end else if (!cn_eff) begin
         // board disabled by the game: forget the link, drop pending work
         tf <= TF_IDLE; alive <= 2'd0; my_id <= 2'd0; my_master <= 1'b0;
         tick_req <= 1'b0;
@@ -643,7 +668,7 @@ always @(posedge clk_sys) begin
 
     // tick sources (set last so a simultaneous clear in TF_IDLE cannot hide a request)
     if (act && vbl_start && !vbl_q) tick_req <= 1'b1;
-    if (act && cn_enable && !cn_q)  tick_req <= 1'b1;
+    if (act && cn_eff && !cn_q)     tick_req <= 1'b1;
 end
 
 endmodule
