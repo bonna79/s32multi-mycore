@@ -171,6 +171,7 @@ module s32_core #(
     input             comm_link_test,
     input       [1:0] comm_link_baud,
     output            comm_peer_seen,
+    output            comm_dbg_blink,
 
     // inputs (already mapped per game class by emu top)
     input       [7:0] in_p1a, in_p2a, in_portc, in_svc12, in_svc34,
@@ -992,6 +993,7 @@ wire [7:0]  comm_cabinet_id_q = 8'h00;
 assign comm_link_txd = 1'b1;
 assign comm_link_up  = 1'b0;
 assign comm_peer_seen = 1'b0;
+assign comm_dbg_blink = 1'b0;
 `else
 wire       comm_cpu_we    = m_req && m_we && sel_comm_ram && m_be[0];
 wire [7:0] comm_cabinet_id_q;
@@ -1017,7 +1019,8 @@ s32_comm_link comm_link (
     .link_up        (comm_link_up),
     .baud_sel       (comm_link_baud),
     .link_test      (comm_link_test),
-    .peer_seen      (comm_peer_seen)
+    .peer_seen      (comm_peer_seen),
+    .dbg_blink      (comm_dbg_blink)
 );
 
 always @(posedge clk_sys) begin
