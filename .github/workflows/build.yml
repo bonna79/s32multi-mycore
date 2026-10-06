@@ -1,1 +1,48 @@
+name: Build RBF
 
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify source files are the latest versions
+        run: |
+          echo "--- md5 dei file sorgente nel repo ---"
+          md5sum Arcade-SegaSystem32Multi.sv rtl/s32_core.sv rtl/io/s32_comm_link.sv
+          fail=0
+          grep -qF "Comm RAM Clear" Arcade-SegaSystem32Multi.sv || { echo "MANCA: Arcade-SegaSystem32Multi.sv e' una versione vecchia"; fail=1; }
+          grep -qF "comm_clr_once" rtl/s32_core.sv || { echo "MANCA: rtl/s32_core.sv e' una versione vecchia"; fail=1; }
+          grep -qF "ctr > 11'd10" rtl/io/s32_comm_link.sv || { echo "MANCA: rtl/io/s32_comm_link.sv e' una versione vecchia"; fail=1; }
+          exit $fail
+
+      - name: Compile with Quartus (inside Docker)
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/build \
+            -w /build \
+            theypsilon/quartus-lite-c5:17.0.2-heavy \
+            bash -c '
+              QSH=$(find / -iname "quartus_sh" 2>/dev/null | grep -v uninstall | head -n1)
+              QDIR=$(dirname "$QSH")
+              echo "Trovato in: $QSH"
+              export LD_LIBRARY_PATH="$QDIR:$LD_LIBRARY_PATH"
+              rm -f "$QDIR/libboost_system.so"
+              "$QSH" --flow compile Arcade-SegaSystem32Multi.qpf
+              QEXIT=$?
+              echo "### QUARTUS_SH EXIT CODE: $QEXIT ###"
+              ls -la output_files/ 2>&1 || echo "output_files ASSENTE"
+              md5sum output_files/*.rbf 2>/dev/null
+              exit $QEXIT
+            '
+
+      - name: Upload RBF
+        uses: actions/upload-artifact@v4
+        with:
+          name: rbf-compilato
+          path: output_files/*.rbf
