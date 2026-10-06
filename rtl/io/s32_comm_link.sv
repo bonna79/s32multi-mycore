@@ -589,21 +589,23 @@ always @(posedge clk_sys) begin
                 if (s0 == 8'h56 && s1 == 8'h37 && h_q == 8'h30) begin
                     sig_hit <= 1'b1; f_sig <= 1'b1;                    // "V70" seen
                     if (clr_once && clr_done) tf <= TF_P4;             // already answered
-                    else begin ctr <= 11'd3; tf <= TF_CLR; clr_done <= 1'b1; end
+                    else begin ctr <= 11'd3; tf <= TF_Z0; clr_done <= 1'b1; end   // reply FIRST
                 end else begin clr_done <= 1'b0; tf <= TF_P4; end
             end
             TF_CLR: begin
-                // Bytes 8..10 hold the "Z80" reply: the game re-reads them right
-                // after a vblank wait, i.e. exactly when this tick runs, so they
-                // are never zeroed (MAME's tick is atomic; ours is not).
+                // The "Z80" reply is written BEFORE this wipe (TF_Z0..Z2): the game
+                // checks it a few instructions after writing CN (its frame wait
+                // returns at once when the vblank flag is already set), and MAME
+                // answers synchronously inside cn_w. Bytes 8..10 are never zeroed
+                // here, so the reply stays readable during the whole wipe.
                 h_addr <= ctr; h_wdata <= 8'h00;
                 h_we <= (ctr < 11'd8) || (ctr > 11'd10);
                 ctr <= ctr + 11'd1;
-                if (ctr == 11'h7FF) tf <= TF_Z0;
+                if (ctr == 11'h7FF) tf <= TF_P4;
             end
             TF_Z0: begin h_addr <= 11'd8;  h_wdata <= 8'h5A; h_we <= 1'b1; tf <= TF_Z1; end
             TF_Z1: begin h_addr <= 11'd9;  h_wdata <= 8'h38; h_we <= 1'b1; tf <= TF_Z2; end
-            TF_Z2: begin h_addr <= 11'd10; h_wdata <= 8'h30; h_we <= 1'b1; tf <= TF_P4; end
+            TF_Z2: begin h_addr <= 11'd10; h_wdata <= 8'h30; h_we <= 1'b1; tf <= TF_CLR; end
             TF_P4: begin                                               // status = waiting
                 h_addr <= 11'd4; h_wdata <= 8'h00; h_we <= 1'b1;
                 tf <= sig_hit ? TF_IDLE : TF_P5;
