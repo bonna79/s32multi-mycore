@@ -12,6 +12,8 @@ The version available in the **Releases** section is a modified version of the c
 
 **WARNING:** I take no responsibility for any damage. Before connecting the two systems, make absolutely sure that the **5V power connection in the USB 3.0 cable has been disconnected**.
 
+Read the guide in PDF format before using the core: https://github.com/bonna79/s32multi-mycore/blob/main/OutRunners_Link_two_MiSTer_Guide_EN.pdf
+
 I personally used a **30 cm USB 3.0 cable** and played for several hours using two FPGA systems without any issues.
 
 My setup consists of:
@@ -110,4 +112,5 @@ Fast flicker: the link had been up and no frame arrived for about 3 seconds.
 ## Credits and license
 
 Core by Meathax (`s32multi`), link code in the fork above. The source of this build is the commit named at the top; the repository's LICENSE file applies (GPL).
+
 
