@@ -13,7 +13,7 @@ The version available in the **Releases** section is a modified version of the c
 **WARNING:** I take no responsibility for any damage. Before connecting the two systems, make absolutely sure that the **5V power connection in the USB 3.0 cable has been disconnected**.
 
 Read the guide in PDF format before using the core: https://github.com/bonna79/s32multi-mycore/blob/main/OutRunners_Link_two_MiSTer_Guide_EN.pdf
-
+Link with a text file where you illustrate the analyzed one and how it works, some information is hypotheses to check: https://github.com/bonna79/s32multi-mycore/blob/main/OutRunners_Link_NET_notes_IT_EN.txt
 I personally used a **30 cm USB 3.0 cable** and played for several hours using two FPGA systems without any issues.
 
 My setup consists of:
