@@ -1,4 +1,5 @@
 # OutRunners Link (alpha test build)
+Modification of the original core using AI, specifically Claude.
 
 ### Introduction
 
