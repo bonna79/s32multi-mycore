@@ -1,0 +1,657 @@
+================================================================================
+OUTRUNNERS LINK - NOTE TECNICHE SULLA PARTE "NET"
+(collegamento tra due MiSTer FPGA)
+================================================================================
+
+Versione italiana (la versione inglese segue più in basso).
+Codice: commit 4fc543f - github.com/bonna79/s32multi-mycore
+Core di base: Meathax, "s32multi" (Sega System 32 / Multi 32)
+Stato: alpha. L'handshake funziona; lo scambio dei dati in gara non è ancora
+verificato su hardware.
+
+Indice
+------
+
+ 1. In breve
+ 2. L'hardware originale
+ 3. Cosa vede il gioco: la RAM condivisa
+ 4. Cosa fa il gioco all'avvio (dal disassemblato della ROM)
+ 5. Cosa fa il nostro modulo: la "scheda comm virtuale"
+ 6. Il protocollo sul filo tra le due MiSTer
+ 7. Il livello fisico: porta USER, cavo, pin
+ 8. Comandi dell'OSD e LED diagnostico
+ 9. Limiti noti e cose non verificate
+10. Come si verifica e si fa il debug
+11. Dove sta il codice
+
+1. In breve
+-----------
+
+In modalità Network, OutRunners (scheda Sega Multi 32) non parla con l'altra
+macchina: scrive e legge una RAM condivisa da 2 KB e due flag, che nei cabinati
+originali appartengono a una scheda di comunicazione (comm board). Quella scheda
+ha un suo processore e un suo firmware, e si occupa di scambiare i dati con le
+altre schede.
+
+Noi non emuliamo la scheda vera. Riproduciamo, a livello di registri, quello che
+la scheda risponde al gioco (la stessa idea della simulazione "s32comm" di MAME)
+e portiamo i dati tra le due MiSTer su un collegamento seriale nostro,
+attraverso la porta USER, con un cavo USB 3.0 A-A senza i 5 V.
+
+ MiSTer 1 (Master)                                  MiSTer 2 (Slave)
+ +-----------------------+                          +-----------------------+
+ | gioco su V70          |                          | gioco su V70          |
+ |  | RAM 2 KB + CN/FG   |                          |  | RAM 2 KB + CN/FG   |
+ |  v                    |                          |  v                    |
+ | scheda comm virtuale  | <-- UART 250k (3,3 V) -->| scheda comm virtuale  |
+ | (s32_comm_link.sv)    |     cavo USB 3.0 A-A     | (s32_comm_link.sv)    |
+ +-----------------------+                          +-----------------------+
+
+2. L'hardware originale
+-----------------------
+
+Dai commenti del sorgente MAME (s32comm), la scheda è la "Sega System Multi32
+Comm PCB 837-8792-91": un Z80 con il proprio firmware (per OutRunners è il
+15033), un controller di data link Fujitsu MB89374, un controller DMA MB89237A e
+una RAM a doppia porta da 2 KB (MB8421). Il V70 principale vede la RAM e due
+flag; il Z80 li usa per spedire e ricevere i frame tramite il chip di data link.
+Con più cabinati collegati si arriva a 8 giocatori; nel menu del gioco il numero
+di cabinato va da 1 a 4.
+
+Ciò che NON sappiamo: il mezzo fisico originale (il codice MAME elenca tre
+possibilità - differenziale, seriale semplice, ottico TOSLINK - senza sceglierne
+una), la velocità e il formato dei frame sul filo. Stanno nel firmware Z80 e nei
+registri del chip, e non risultano documentati nelle fonti che abbiamo.
+
+MAME non emula Z80 e chip: usa per default una simulazione ad alto livello
+(#define S32COMM_SIMULATION), che risponde al gioco a livello di RAM e flag, e
+scambia i frame in anello tra i nodi. Il nostro lavoro segue quell'impostazione.
+
+3. Cosa vede il gioco: la RAM condivisa
+---------------------------------------
+
+Il V70 vede la RAM condivisa a 0x800000-0x800FFF, un byte ogni parola a 16 bit:
+il byte numero i sta all'indirizzo 0x800000 + 2*i (conta solo D[7:0]). Due
+registri a un bit:
+
+  - CN (0x801000, bit 0): accende la scheda. In lettura vale 0xFE | CN. Scrivere
+    CN=0 azzera anche FG.
+  - FG (0x801002, bit 0): scrivibile solo con CN=1. In lettura vale 0xFE | FG;
+    il bit 7 (ZFG) risulta sempre 1, come nella simulazione di MAME.
+
+Mappa dei byte della RAM (indice i):
+
+ [0]            numero di nodi          (scrive la scheda; 0xFF = link fallito)
+ [1]            ID di questo nodo       (scrive la scheda; master=1, slave=2)
+ [2]            modo del nodo           (scrive il gioco; 0 = slave, 1 = master)
+ [3]            "pronto a inviare"      (scrive il gioco; la scheda lo azzera
+                                         a ogni tick)
+ [4]            stato del link          (scrive la scheda; 0=attesa, 1=online)
+ [5 .. 0x0F]    11 byte "extra" del master, copiati dal master allo slave
+ [8 .. 0x0A]    (stessi byte) risposta "Z80" = 5A 38 30 alla firma "V70" = 56 37
+                30 scritta dal gioco in [0..2]
+ [0x10 ..]      finestra di ricezione: uno slot da 0xE0 byte per nodo
+                (slot = id - 1: master 0x10..0xEF, slave 0xF0..0x1CF)
+ [0x710..0x7EF] finestra di trasmissione: il frame di 224 byte che il gioco
+                scrive per inviarlo (indirizzo 0x800E20)
+
+Nota: i byte [8..0x0A] fanno parte dell'intervallo [5..0x0F], ma finché il link
+non è attivo servono per la risposta "Z80"; dopo l'aggancio lo slave li
+sovrascrive con i byte extra del master.
+
+4. Cosa fa il gioco all'avvio (dal disassemblato della ROM)
+-----------------------------------------------------------
+
+Dal disassemblato della ROM del programma (generato con il debugger di MAME) la
+procedura di controllo rete è attorno a 0xD1D0 nella ROM World; nella ROM US il
+codice è lo stesso a indirizzi spostati di circa 0x100. Sequenza:
+
+  1. CN=0, breve attesa, prepara alcune finestre della RAM con dati presi dalla
+     ROM.
+  2. Test della RAM condivisa: scrive e rilegge tutti i 2048 byte con pattern
+     che ruotano. Se non torna: errore "CONNECTION ERROR".
+  3. Scrive la firma "V70" in [0..2], azzera il byte [0x0A], mette FG=0 e CN=1.
+  4. Aspetta un frame (la funzione di attesa controlla un flag messo
+     dall'interrupt di vblank: se è già alzato, ritorna subito) e controlla FG.
+  5. Controllo della "parola chiave": rilegge [0..2] e [8..0x0A] (letture a 16
+     bit di cui tiene solo il byte basso) e le confronta con V70 e Z80. Se sono
+     diversi: stesso testo "CONNECTION ERROR" (nella ROM i due percorsi puntano
+     allo stesso messaggio).
+  6. FG=1, attesa; azzera [6] (codice di errore della scheda: se diventa diverso
+     da zero, "COMMUNICATION BOARD ERROR").
+  7. Scrive in [2] il ruolo (da Privilege Mode: master=1, slave=0) e gestisce FG
+     con altre attese.
+  8. Copia il proprio ID in testa alla finestra di trasmissione, scrive [3]=0xFF
+     e aspetta [4] diverso da zero, con un timeout (conto alla rovescia di 3600
+     frame); scaduto: "COMMUNICATION TIME OUT".
+  9. Con [4] diverso da zero legge [0] (macchine) e [1] (suo ID) e mostra
+     "COMMUNICATION SUCCESS. THIS MACHINE ID IS n".
+
+Nella ROM ci sono sei messaggi d'errore: CONNECTION ERROR, MISSMATCH KEYWORD,
+COMMUNICATION BOARD ERROR, COMMUNICATION TIME OUT, COMMUNICATION ERROR e
+SYNCRONIZE ERROR. Non abbiamo verificato quale percorso porti a ciascuno, a
+parte quelli sopra. Dopo il successo la ROM ha anche passi "CHECK TRANS END" e
+"CHECK SYNCRONIZE" che non abbiamo ancora provato con la nostra scheda.
+
+Due lezioni pratiche:
+
+  - La risposta "Z80" deve essere visibile entro pochi microsecondi dalla
+    scrittura di CN=1, perché il gioco la controlla poche istruzioni dopo. In
+    MAME la risposta avviene dentro la scrittura di CN. Nel nostro modulo viene
+    scritta per prima, entro circa 20 cicli di clock (meno di 1 us).
+  - La cancellazione della RAM che segue la firma non deve mai far vedere al
+    gioco "Z80" azzerato: per questo salta i byte 8..10.
+
+5. Cosa fa il nostro modulo: la "scheda comm virtuale"
+------------------------------------------------------
+
+Il modulo s32_comm_link.sv ha tre parti: la RAM condivisa, il motore che
+risponde al gioco (una macchina a stati), e il trasporto seriale con il
+protocollo tra le due MiSTer.
+
+RAM: 2 KB con una sola porta di scrittura. La CPU ha la priorità; le scritture
+del motore vengono accodate e ripetute se collidono, e il motore aspetta che
+siano completate. Ci sono due copie identiche, una letta dal V70 e una letta dal
+motore, così ognuno ha la sua porta di lettura.
+
+Il motore lavora un "tick" per volta: parte all'inizio di ogni vblank (circa 60
+volte al secondo) e subito quando il gioco scrive CN=1. Funziona solo se Cabinet
+Link = Network e CN=1 (oppure con Link Test). Con Cabinet Link = Standalone il
+modulo è inerte e la RAM è solo RAM locale.
+
+Prima dell'aggancio, a ogni tick:
+
+  1. Legge [0..2]. Se trova V70 (56 37 30): scrive Z80 in [8..0x0A] e poi azzera
+     [3..0x7FF] saltando 8..10 (di default una sola volta per ogni firma:
+     opzione "Comm RAM Clear").
+  2. Scrive [4]=0 (in attesa).
+  3. Se [2] vale 0 o 1 (ruolo valido): manda un frame HELLO con il proprio
+     ruolo.
+  4. Se negli ultimi 8 tick è arrivato un HELLO dall'altra macchina con ruolo
+     complementare (uno master, uno slave): link attivo. Il master prende ID 1,
+     lo slave ID 2; scrive [4]=1, [1]=ID, [0]=2 (due nodi).
+
+Con il link attivo, a ogni tick:
+
+  1. Se dall'altra macchina non è arrivato nessun frame valido per 180 tick
+     (circa 3 secondi): scrive [0]=0xFF (link fallito) e si ferma.
+  2. Se è arrivato un frame DATA dell'altro nodo: copia i 224 byte nella sua
+     finestra di ricezione (slot dell'altro nodo).
+  3. Slave: se è arrivato un frame FD, copia gli 11 byte extra in [5..0x0F].
+  4. Se [3] è diverso da zero (il gioco ha un frame pronto) e il frame
+     precedente è già partito: copia la finestra di trasmissione (0x710..0x7EF),
+     la invia come DATA e ne mette una copia anche nel proprio slot di
+     ricezione, come fa MAME.
+  5. Master: invia un frame FD con gli 11 byte [5..0x0F].
+  6. Invia un HELLO (serve anche da "battito" per capire che il link è vivo).
+  7. Azzera [3].
+
+Se il gioco spegne la scheda (CN=0) il modulo dimentica il link. Gli stadi del
+LED (punto 8) sono flag "appiccicosi" che registrano fin dove è arrivato
+l'handshake dall'ultimo Reset.
+
+6. Il protocollo sul filo tra le due MiSTer
+-------------------------------------------
+
+Seriale UART 8N1, a riposo alta, a 250000 baud (selezionabile da OSD: 250k,
+115k, 57.6k, 500k; deve essere uguale su entrambe). Ogni frame:
+
+ A5 | TIPO | dati ... | CHK          CHK = 0x5C xor TIPO xor tutti i byte dati
+ TIPO 01  HELLO  1 byte di dati   il ruolo del mittente (0 slave, 1 master)
+ TIPO 02  FD     11 byte          dal master allo slave: [5..0x0F]
+ TIPO 03  DATA   225 byte         ID del mittente + 224 byte del frame di gioco
+
+Il ricevitore accetta un frame solo se la checksum torna; DATA è ricevuto in un
+doppio buffer, quindi un frame a metà non rovina quello già completo.
+
+Banda: da master a slave circa 228 (DATA) + 15 (FD) + 4 (HELLO) = 247 byte per
+tick, a 60 tick/s sono circa 14,8 kB/s, cioè circa 148 kbit/s sul filo (10 bit
+per byte): sta nei 250 kbaud. Un DATA da 228 byte impiega circa 9,1 ms a 250k. A
+115k e 57.6k i frame non reggono 60 al secondo e quelli che non riescono a
+partire vengono scartati: usate 250k.
+
+Latenza: stima (non misurata) da 1 a 3 frame per portare lo stato dell'altro
+giocatore (attesa del tick + trasmissione + tick dell'altra macchina).
+
+Non è il protocollo originale Sega e non è compatibile con i cabinati veri. Non
+c'è anello (nessuna ritrasmissione tra nodi) e non c'è la sincronizzazione di
+frame che MAME simula con i frame 0xFC.
+
+7. Il livello fisico: porta USER, cavo, pin
+-------------------------------------------
+
+La porta USER è un connettore a forma di USB (ma non è USB) con 7 linee dati
+USER_IO[6:0] a 3,3 V (LVTTL), massa e alimentazioni. Per il framework MiSTer è
+"open-drain": scrivere 1 su USER_OUT rilascia il pin, scrivere 0 lo tira a
+massa, e USER_IN legge il livello. Il ritorno a 1 è dovuto ai pull-up deboli
+interni dell'FPGA, che nel progetto sono attivi (WEAK_PULL_UP_RESISTOR su
+USER_IO[*] in sys.tcl).
+
+Pin usati, uguali su tutte e due le macchine:
+
+ TX  su USER_IO[2]  (USB pin 8, SSTX-)   -> arriva su USER_IO[5] dell'altra
+ RX  su USER_IO[5]  (USB pin 5, SSRX-)   <- arriva da USER_IO[2] dell'altra
+ Gli altri pin restano rilasciati (alti).
+
+Il cavo è un USB 3.0 Tipo A maschio-maschio. In quel cavo i fili D-, D+, massa e
+drain vanno dritti, mentre le due coppie SuperSpeed sono incrociate (pin 5 con
+8, pin 6 con 9). Per questo "TX su pin 8" di una macchina arriva al "RX su pin
+5" dell'altra, in tutte e due le direzioni, senza dover distinguere i ruoli. Il
+pin 1 (VBUS, 5 V) non deve essere collegato: unire i 5 V di due MiSTer le può
+danneggiare.
+
+Nei test una delle due macchine era una SuperStation One con SuperDock, con SNAC
+Bypass su ON; l'altra una MiSTer normale. Lo stesso cavo e gli stessi pin sono
+stati provati per oltre 45 minuti con il core PSX "link cable" (alpha) di
+Kuba-J, che però pilota i pin in push-pull; noi restiamo open-drain. Se in
+futuro servisse più robustezza, si potrebbe adottare il driver push-pull del
+fork PSX (USER_PUSHPULL/USER_OE), ma richiede modifiche a sys/.
+
+8. Comandi dell'OSD e LED diagnostico
+-------------------------------------
+
+ Voce OSD         status   Valori                 Uso
+ Cabinet Link     [8]      Standalone | Network   accende il link
+ Link Role        [30]     Slave | Master         ignorata (decide il gioco)
+ Cabinet ID       [32:31]  0..3                   ignorata (letta solo a
+                                                  0x801004, non autentico)
+ Link Baud        [34:33]  250k|115k|57.6k|500k   velocità (uguale su entrambe)
+ Comm RAM Clear   [35]     Once | Each tick       Once di default (consigliato)
+ Link Test        [36]     Off | On               prova del cavo, senza il gioco
+ Comm Hi Byte     [37]     FF | 00                byte alto delle letture RAM
+                                                  (lasciare FF)
+
+Il LED del disco (HDD) sulla scheda I/O conta, con Link Test = Off, fin dove è
+arrivato l'handshake: N lampeggi, pausa, ripete. Si azzera con il Reset.
+
+ 0 spento  il gioco non ha acceso la scheda   4  il gioco ha scritto in [2]
+ 1  CN scritto a 1                            5  ruolo valido: partono gli HELLO
+ 2  firma V70 vista, risposta Z80 data        6  HELLO dall'altra macchina
+ 3  il gioco ha letto la risposta Z80         7  link attivo
+ sfarfallio veloce: il link c'era ed è caduto (nessun frame per ~3 s)
+
+Con Link Test = On (gioco in stand-alone) le macchine si scambiano HELLO a ogni
+vblank e il LED resta fisso finché arrivano frame validi (tenuta di circa 0,7
+s): serve a provare cavo, pin e baud senza il gioco. Il LED USER della scheda si
+accende anche quando il link è attivo.
+
+9. Limiti noti e cose non verificate
+------------------------------------
+
+  - Solo due macchine (master e slave). Niente relay/ISDN e niente anelli da 3-4
+    cabinati.
+  - Il protocollo sul filo è nostro: non è compatibile con i cabinati originali.
+  - Verificato: handshake fino a "COMMUNICATION SUCCESS" con ID 2 slave, link
+    attivo per oltre 30 minuti senza cadute (LED a 7).
+  - Non verificato: lo scambio dei frame di gioco in una gara vera (l'auto
+    dell'altro giocatore), i passi "CHECK TRANS END" e "CHECK SYNCRONIZE", la
+    latenza reale.
+  - Il comportamento esatto del firmware originale ci è noto solo attraverso
+    MAME e il disassemblato del gioco.
+
+10. Come si verifica e si fa il debug
+-------------------------------------
+
+  - Link Test + LED: dice se cavo, pin e baud funzionano (LED fisso; si spegne
+    circa 1 s dopo aver scollegato il cavo).
+  - LED a stadi: dice a che punto si ferma l'handshake con il gioco.
+  - Testbench (tb_s32_comm_link.sv, Icarus Verilog): due istanze del modulo
+    collegate TX->RX; un "gioco" finto fa handshake V70/Z80, ruoli, scambio dei
+    frame nei due sensi, byte extra del master, perdita del link, risposta Z80
+    entro 60 cicli, e controlla che la risposta non sparisca mai. Comando:
+    iverilog -g2012 -o tb tb_s32_comm_link.sv s32_comm_link.sv && vvp tb
+    (atteso: PASS all checks).
+  - Disassemblato della ROM con il debugger di MAME: creare un file con "focus
+    maincpu", "dasm file.txt,0,40000,1", "quit" e lanciare mame orunners -debug
+    -debugscript file.
+  - Build: GitHub Actions (build.yml), Quartus Prime Lite 17.0.2 nell'immagine
+    Docker theypsilon/quartus-lite-c5:17.0.2-heavy. Il workflow stampa gli md5
+    dei sorgenti, si ferma se mancano i marcatori delle versioni nuove e
+    fallisce se Quartus restituisce un errore.
+
+11. Dove sta il codice
+----------------------
+
+ rtl/io/s32_comm_link.sv        scheda comm virtuale: RAM, motore, UART,
+                                protocollo
+ rtl/s32_core.sv                registri CN/FG, decodifica 0x800000-0x801002,
+                                lettura RAM, tick di vblank, porte al modulo
+ Arcade-SegaSystem32Multi.sv    voci OSD, pin USER (IO[2] TX, IO[5] RX), LED
+ .github/workflows/build.yml    build automatica
+ tb_s32_comm_link.sv            testbench (non in rtl/)
+ s32comm.cpp / s32comm.h        riferimento: simulazione MAME (Ariane Fugmann)
+
+Crediti: core s32multi di Meathax; simulazione s32comm di MAME; cavo e pin
+validati con il core PSX link cable (alpha) di Kuba-J.
+
+
+
+================================================================================
+OUTRUNNERS LINK - TECHNICAL NOTES ON THE "NET" PART
+(link between two MiSTer FPGAs)
+================================================================================
+
+English version (the Italian version is above).
+Code: commit 4fc543f - github.com/bonna79/s32multi-mycore
+Base core: Meathax, "s32multi" (Sega System 32 / Multi 32)
+Status: alpha. The handshake works; the exchange of game data in a race is not
+yet verified on hardware.
+
+Contents
+--------
+
+ 1. Overview
+ 2. The original hardware
+ 3. What the game sees: the shared RAM
+ 4. What the game does at start-up (from the ROM disassembly)
+ 5. What our module does: the "virtual comm board"
+ 6. The wire protocol between the two MiSTers
+ 7. The physical layer: USER port, cable, pins
+ 8. OSD controls and the diagnostic LED
+ 9. Known limits and unverified items
+10. How to verify and debug
+11. Where the code is
+
+1. Overview
+-----------
+
+In Network mode, OutRunners (Sega Multi 32 board) does not talk to the other
+machine. It reads and writes a 2 KB shared RAM and two flags that, in the
+original cabinets, belong to a communication board (comm board). That board has
+its own processor and firmware, and takes care of exchanging data with the other
+boards.
+
+We do not emulate the real board. We reproduce, at register level, what the
+board answers to the game (the same idea as MAME's "s32comm" simulation) and we
+carry the data between the two MiSTers over our own serial link, through the
+USER port, with a USB 3.0 A-A cable without the 5 V.
+
+ MiSTer 1 (Master)                                  MiSTer 2 (Slave)
+ +-----------------------+                          +-----------------------+
+ | game on the V70       |                          | game on the V70       |
+ |  | 2 KB RAM + CN/FG   |                          |  | 2 KB RAM + CN/FG   |
+ |  v                    |                          |  v                    |
+ | virtual comm board    | <-- UART 250k (3.3 V) -->| virtual comm board    |
+ | (s32_comm_link.sv)    |     USB 3.0 A-A cable    | (s32_comm_link.sv)    |
+ +-----------------------+                          +-----------------------+
+
+2. The original hardware
+------------------------
+
+From the comments in MAME's s32comm source, the board is the "Sega System
+Multi32 Comm PCB 837-8792-91": a Z80 with its own firmware (15033 for
+OutRunners), a Fujitsu MB89374 data link controller, an MB89237A DMA controller
+and a 2 KB dual-port RAM (MB8421). The main V70 sees the RAM and two flags; the
+Z80 uses them to send and receive frames through the data link chip. Several
+linked cabinets allow up to 8 players; in the game menu the cabinet number goes
+from 1 to 4.
+
+What we do NOT know: the original physical medium (the MAME code lists three
+possibilities - differential, plain serial, optical TOSLINK - without choosing
+one), and the speed and format of the frames on the wire. They live in the Z80
+firmware and in the chip registers, and are not documented in the sources we
+have.
+
+MAME does not emulate the Z80 or the chips: by default it uses a high-level
+simulation (#define S32COMM_SIMULATION) that answers the game at RAM and flag
+level, and passes frames around a ring of nodes. Our work follows that approach.
+
+3. What the game sees: the shared RAM
+-------------------------------------
+
+The V70 sees the shared RAM at 0x800000-0x800FFF, one byte per 16-bit word: byte
+number i is at address 0x800000 + 2*i (only D[7:0] counts). Two one-bit
+registers:
+
+  - CN (0x801000, bit 0): turns the board on. Reads as 0xFE | CN. Writing CN=0
+    also clears FG.
+  - FG (0x801002, bit 0): writable only when CN=1. Reads as 0xFE | FG; bit 7
+    (ZFG) always reads 1, like in MAME's simulation.
+
+Map of the RAM bytes (index i):
+
+ [0]            number of nodes         (written by the board; 0xFF=failed)
+ [1]            ID of this node         (written by the board; master = 1,
+                                         slave = 2)
+ [2]            node mode               (written by the game; 0 = slave,
+                                         1 = master)
+ [3]            "ready to send"         (written by the game; the board clears
+                                         it every tick)
+ [4]            link status             (written by the board; 0 = waiting,
+                                         1 = online)
+ [5 .. 0x0F]    11 "extra" master bytes, copied from master to slave
+ [8 .. 0x0A]    (same bytes) the "Z80" = 5A 38 30 answer to the "V70" = 56 37 30
+                signature that the game writes in [0..2]
+ [0x10 ..]      receive window: one 0xE0-byte slot per node
+                (slot = id - 1: master 0x10..0xEF, slave 0xF0..0x1CF)
+ [0x710..0x7EF] transmit window: the 224-byte frame the game writes to send
+                (address 0x800E20)
+
+Note: bytes [8..0x0A] are part of the [5..0x0F] range, but until the link is up
+they carry the "Z80" answer; after the link is up the slave overwrites them with
+the master's extra bytes.
+
+4. What the game does at start-up (from the ROM disassembly)
+------------------------------------------------------------
+
+From the disassembly of the program ROM (made with MAME's debugger), the network
+check routine is around 0xD1D0 in the World ROM; in the US ROM the same code
+sits at addresses shifted by about 0x100. Sequence:
+
+  1. CN=0, short delay, prepares some RAM windows with data taken from the ROM.
+  2. Shared RAM test: writes and reads back all 2048 bytes with rotating
+     patterns. If it fails: "CONNECTION ERROR".
+  3. Writes the "V70" signature in [0..2], clears byte [0x0A], sets FG=0 and
+     CN=1.
+  4. Waits one frame (the wait routine checks a flag set by the vblank
+     interrupt: if it is already set, it returns at once) and checks FG.
+  5. "Keyword" check: re-reads [0..2] and [8..0x0A] (16-bit reads of which it
+     keeps only the low byte) and compares them with V70 and Z80. If different:
+     same "CONNECTION ERROR" text (in the ROM both paths point to the same
+     message).
+  6. FG=1, wait; clears [6] (board error code: if it becomes non-zero,
+     "COMMUNICATION BOARD ERROR").
+  7. Writes the role in [2] (from Privilege Mode: master=1, slave=0) and handles
+     FG with more waits.
+  8. Copies its own ID to the head of the transmit window, writes [3]=0xFF and
+     waits for [4] to become non-zero, with a timeout (3600-frame countdown); on
+     expiry: "COMMUNICATION TIME OUT".
+  9. With [4] non-zero it reads [0] (machines) and [1] (its ID) and shows
+     "COMMUNICATION SUCCESS. THIS MACHINE ID IS n".
+
+The ROM has six error messages: CONNECTION ERROR, MISSMATCH KEYWORD,
+COMMUNICATION BOARD ERROR, COMMUNICATION TIME OUT, COMMUNICATION ERROR and
+SYNCRONIZE ERROR. We have not verified which path leads to each, apart from
+those above. After success the ROM also has "CHECK TRANS END" and "CHECK
+SYNCRONIZE" steps that we have not yet tried with our board.
+
+Two practical lessons:
+
+  - The "Z80" answer must be visible within a few microseconds of the CN=1
+    write, because the game checks it a few instructions later. In MAME the
+    answer happens inside the CN write. In our module it is written first,
+    within about 20 clock cycles (under 1 us).
+  - The RAM wipe that follows the signature must never show the game a zeroed
+    "Z80": that is why it skips bytes 8..10.
+
+5. What our module does: the "virtual comm board"
+-------------------------------------------------
+
+The module s32_comm_link.sv has three parts: the shared RAM, the engine that
+answers the game (a state machine), and the serial transport with the protocol
+between the two MiSTers.
+
+RAM: 2 KB with a single write port. The CPU has priority; engine writes are
+queued and retried on collision, and the engine waits until they complete. There
+are two identical copies, one read by the V70 and one read by the engine, so
+each has its own read port.
+
+The engine works one "tick" at a time: it starts at the beginning of every
+vblank (about 60 times a second) and immediately when the game writes CN=1. It
+runs only if Cabinet Link = Network and CN=1 (or with Link Test). With Cabinet
+Link = Standalone the module is inert and the RAM is just local RAM.
+
+Before the link is up, at every tick:
+
+  1. Reads [0..2]. If it finds V70 (56 37 30): writes Z80 in [8..0x0A], then
+     wipes [3..0x7FF] skipping 8..10 (by default only once per signature: the
+     "Comm RAM Clear" option).
+  2. Writes [4]=0 (waiting).
+  3. If [2] is 0 or 1 (valid role): sends a HELLO frame with its own role.
+  4. If a HELLO from the other machine with the complementary role (one master,
+     one slave) arrived in the last 8 ticks: link up. The master takes ID 1, the
+     slave ID 2; it writes [4]=1, [1]=ID, [0]=2 (two nodes).
+
+With the link up, at every tick:
+
+  1. If no valid frame has arrived from the other machine for 180 ticks (about 3
+     seconds): writes [0]=0xFF (link failed) and stops.
+  2. If a DATA frame from the other node arrived: copies its 224 bytes into its
+     receive window (the other node's slot).
+  3. Slave: if an FD frame arrived, copies the 11 extra bytes into [5..0x0F].
+  4. If [3] is non-zero (the game has a frame ready) and the previous frame has
+     already left: copies the transmit window (0x710..0x7EF), sends it as DATA
+     and also puts a copy in its own receive slot, as MAME does.
+  5. Master: sends an FD frame with the 11 bytes [5..0x0F].
+  6. Sends a HELLO (it also works as a "heartbeat" to tell that the link is
+     alive).
+  7. Clears [3].
+
+If the game turns the board off (CN=0) the module forgets the link. The LED
+stages (point 8) are sticky flags that record how far the handshake got since
+the last Reset.
+
+6. The wire protocol between the two MiSTers
+--------------------------------------------
+
+UART 8N1, idle high, 250000 baud (selectable from the OSD: 250k, 115k, 57.6k,
+500k; must be the same on both). Every frame:
+
+ A5 | TYPE | data ... | CHK          CHK = 0x5C xor TYPE xor all data bytes
+ TYPE 01  HELLO  1 data byte         the sender's role (0 slave, 1 master)
+ TYPE 02  FD     11 bytes            master to slave: [5..0x0F]
+ TYPE 03  DATA   225 bytes           sender ID + 224 bytes of the game frame
+
+The receiver accepts a frame only if the checksum matches; DATA is received into
+a double buffer, so a half-received frame does not spoil the one that is already
+complete.
+
+Bandwidth: from master to slave about 228 (DATA) + 15 (FD) + 4 (HELLO) = 247
+bytes per tick; at 60 ticks/s that is about 14.8 kB/s, i.e. about 148 kbit/s on
+the wire (10 bits per byte): it fits in 250 kbaud. A 228-byte DATA frame takes
+about 9.1 ms at 250k. At 115k and 57.6k the frames cannot keep up with 60 per
+second and the ones that cannot leave are dropped: use 250k.
+
+Latency: an estimate (not measured) of 1 to 3 frames to carry the other player's
+state (waiting for the tick + transmission + the other machine's tick).
+
+This is not the original Sega protocol and it is not compatible with real
+cabinets. There is no ring (no forwarding between nodes) and no frame
+synchronisation, which MAME simulates with the 0xFC frames.
+
+7. The physical layer: USER port, cable, pins
+---------------------------------------------
+
+The USER port is a USB-shaped connector (but not USB) with 7 data lines
+USER_IO[6:0] at 3.3 V (LVTTL), ground and power rails. For the MiSTer framework
+it is "open-drain": writing 1 to USER_OUT releases the pin, writing 0 pulls it
+to ground, and USER_IN reads the level. The return to 1 comes from the FPGA's
+weak internal pull-ups, which are enabled in the project (WEAK_PULL_UP_RESISTOR
+on USER_IO[*] in sys.tcl).
+
+Pins used, the same on both machines:
+
+ TX  on USER_IO[2]  (USB pin 8, SSTX-)   -> reaches USER_IO[5] of the other
+ RX  on USER_IO[5]  (USB pin 5, SSRX-)   <- comes from USER_IO[2] of the other
+ All other pins stay released (high).
+
+The cable is a USB 3.0 Type-A male-to-male. In that cable the D-, D+, ground and
+drain wires run straight, while the two SuperSpeed pairs are crossed (pin 5 with
+8, pin 6 with 9). That is why one machine's "TX on pin 8" arrives at the other's
+"RX on pin 5", in both directions, with no need to tell the roles apart. Pin 1
+(VBUS, 5 V) must not be connected: joining the 5 V of two MiSTers can damage
+them.
+
+In our tests one machine was a SuperStation One with its SuperDock, with SNAC
+Bypass ON; the other was a normal MiSTer. The same cable and pins were tested
+for over 45 minutes with Kuba-J's PSX "link cable" core (alpha), which however
+drives the pins push-pull; we stay open-drain. If more robustness is needed in
+the future, the PSX fork's push-pull driver (USER_PUSHPULL/USER_OE) could be
+adopted, but it requires changes to sys/.
+
+8. OSD controls and the diagnostic LED
+--------------------------------------
+
+ OSD entry        status   Values                 Use
+ Cabinet Link     [8]      Standalone | Network   turns the link on
+ Link Role        [30]     Slave | Master         ignored (the game decides)
+ Cabinet ID       [32:31]  0..3                   ignored (only read back at
+                                                  0x801004, a non-authentic
+                                                  register)
+ Link Baud        [34:33]  250k|115k|57.6k|500k   speed (same on both)
+ Comm RAM Clear   [35]     Once | Each tick       Once by default (recommended)
+ Link Test        [36]     Off | On               cable test, without the game
+ Comm Hi Byte     [37]     FF | 00                high byte of RAM reads
+                                                  (leave at FF)
+
+With Link Test = Off, the disk (HDD) LED on the I/O board counts how far the
+handshake got: N flashes, pause, repeat. It is cleared by Reset.
+
+ 0 off     the game has not turned board on   4  the game wrote to [2]
+ 1  CN written to 1                            5  valid role: HELLOs start
+ 2  V70 signature seen, Z80 answer given       6  HELLO from the other machine
+ 3  the game read the Z80 answer               7  link up
+ fast flicker: the link was up and dropped (no frame for ~3 s)
+
+With Link Test = On (game stand-alone) the machines exchange HELLOs on every
+vblank and the LED stays steady as long as valid frames arrive (hold time about
+0.7 s): it tests the cable, the pins and the baud rate without the game. The
+board's USER LED also lights when the link is up.
+
+9. Known limits and unverified items
+------------------------------------
+
+  - Two machines only (master and slave). No relay/ISDN and no rings of 3-4
+    cabinets.
+  - The wire protocol is ours: it is not compatible with original cabinets.
+  - Verified: handshake up to "COMMUNICATION SUCCESS" with slave ID 2, link up
+    for over 30 minutes with no drops (LED at 7).
+  - Not verified: the exchange of game frames in a real race (the other player's
+    car), the "CHECK TRANS END" and "CHECK SYNCRONIZE" steps, the real latency.
+  - The exact behaviour of the original firmware is known to us only through
+    MAME and the disassembly of the game.
+
+10. How to verify and debug
+---------------------------
+
+  - Link Test + LED: tells whether cable, pins and baud rate work (steady LED;
+    it goes off about 1 s after the cable is unplugged).
+  - Staged LED: tells where the handshake with the game stops.
+  - Testbench (tb_s32_comm_link.sv, Icarus Verilog): two instances of the module
+    wired TX->RX; a fake "game" does the V70/Z80 handshake, roles, frame
+    exchange in both directions, the master's extra bytes, link loss, the Z80
+    answer within 60 cycles, and checks that the answer never disappears.
+    Command: iverilog -g2012 -o tb tb_s32_comm_link.sv s32_comm_link.sv && vvp
+    tb (expected: PASS all checks).
+  - ROM disassembly with MAME's debugger: create a file with "focus maincpu",
+    "dasm file.txt,0,40000,1", "quit" and run mame orunners -debug -debugscript
+    file.
+  - Build: GitHub Actions (build.yml), Quartus Prime Lite 17.0.2 in the Docker
+    image theypsilon/quartus-lite-c5:17.0.2-heavy. The workflow prints the md5
+    of the sources, stops if the markers of the new versions are missing, and
+    fails if Quartus returns an error.
+
+11. Where the code is
+---------------------
+
+ rtl/io/s32_comm_link.sv        virtual comm board: RAM, engine, UART, protocol
+ rtl/s32_core.sv                CN/FG registers, decoding 0x800000-0x801002,
+                                RAM reads, vblank tick, ports to the module
+ Arcade-SegaSystem32Multi.sv    OSD entries, USER pins (IO[2] TX, IO[5] RX),
+                                LEDs
+ .github/workflows/build.yml    automatic build
+ tb_s32_comm_link.sv            testbench (not in rtl/)
+ s32comm.cpp / s32comm.h        reference: MAME simulation (Ariane Fugmann)
+
+Credits: s32multi core by Meathax; MAME's s32comm simulation; cable and pins
+validated with Kuba-J's PSX link cable core (alpha).
