@@ -1,122 +1,112 @@
-# Sega System Multi 32: OutRunners for MiSTer FPGA
+# OutRunners Link (alpha test build)
 
-MiSTer FPGA core for Sega's OutRunners Multi 32 cockpit board
-(837-8676 / 171-6253C). It targets the DE10-Nano with SDRAM and uses the
-single production image `Arcade-SegaSystem32Multi.rbf`; the three OutRunners
-MRAs select the World, US, or Japan ROM set.
+### Introduction
 
-This production profile is OutRunners-only. It contains the dual-screen
-Multi 32 video path, two cockpit I/O lanes, the 837-7536 analog board, and the
-315-5560 MultiPCM path. Other System 32, Multi 32, and AS-1 games are not
-supported. Commercial ROMs are not included.
+The original source code for this core can be found at the following link:  
+https://github.com/meathax/s32multi
 
-## Features in the OSD
+The version available in the **Releases** section is a modified version of the core that allows **OutRunners** to be played using **two MiSTer FPGA systems connected together** with a modified USB 3.0 male-to-male cable.
 
-- Original 4:3 or full-screen aspect ratio
-- Normal, vertical-integer, or full-integer scaling
-- Optional CRT 25%, 50%, and 75% scandoubler effects
-- Multi 32 screen A/B selection and optional side-by-side split-screen view
-- Persistent 128-byte 93C46 high-score/settings storage
-- Service mode and reset, with independent Test/Service controls for each
-  cockpit
-- OutRunners controls from each MRA: Shift Up, Shift Down, DJ/Music, previous
-  track, next track, Accelerate, Brake, Start, Coin, Test, and Service
-- Independent P1/P2 steering from analog wheel/stick coordinates, absolute
-  paddle devices, or relative spinners, including reversible spinner direction
-- Accelerator and brake inputs from analog axes or dedicated digital fallbacks
+**IMPORTANT:** The cable must have the **5V power line disconnected**. If you use a standard cable with the 5V power pin still connected, you may damage your MiSTer FPGA systems.
 
-## PCB Accuracy
+**WARNING:** I take no responsibility for any damage. Before connecting the two systems, make absolutely sure that the **5V power connection in the USB 3.0 cable has been disconnected**.
 
-This table lists only shared custom-chip roles supported by the available
-schematic or silicon evidence. OutRunners-specific Multi 32 PCB captures are
-not currently in the evidence ledger, so this is not a blanket board-level or
-cycle-accuracy claim. Open timing, analogue, PLD, and protection questions are
-tracked in the [PCB evidence ledger](docs/pcb/system32_evidence.json).
+I personally used a **30 cm USB 3.0 cable** and played for several hours using two FPGA systems without any issues.
 
-| Area | Evidence | Core implementation |
-| --- | --- | --- |
-| Scroll hardware | Sega schematics, sheet 2; Sega 315-5387 | Four tilemap layers and dual-port VRAM in [`s32_tilemap.sv`](rtl/video/s32_tilemap.sv) |
-| Objects/frame memory | Sega schematics, sheets 3-4; Sega 315-5386 | Object processing and buffered framebuffer in [`s32_sprite.sv`](rtl/video/s32_sprite.sv) and [`s32_fb_if.sv`](rtl/mem/s32_fb_if.sv) |
-| Colour/video output | Sega schematics, sheet 5; [315-5242 silicon evidence](https://github.com/furrtek/SiliconRE/tree/master/Sega/315-5242) | Palette, priority, shadow/highlight, and RGB output in [`s32_mixer.sv`](rtl/video/s32_mixer.sv) and [`s32_palette.sv`](rtl/video/s32_palette.sv) |
-| I/O and EEPROM | Sega schematics, sheet 6 | 315-5296 I/O and BR93C46 serial storage in [`s32_io.sv`](rtl/io/s32_io.sv) |
+My setup consists of:
 
-See [hardware references](docs/references.md) for the schematic provenance and
-detailed source record.
+- **Master:** standard MiSTer FPGA
+- **Slave:** SuperStation One FPGA
 
-## Supported games
+The USB 3.0 cable must be connected to the **User I/O port on both systems**, which is the same port normally used for **SNAC connections**.
 
-The three tracked MRA variants use the same production RBF:
 
-- **OutRunners (World):** MAME set `orunners`
-- **OutRunners (US):** MAME set `orunnersu`, parent `orunners`
-- **OutRunners (Japan):** MAME set `orunnersj`, parent `orunners`
+Two MiSTer FPGAs linked through the USER port, playing Sega **OutRunners** (Multi 32 board) like two linked cabinets.
 
-No other System 32, Multi 32, or AS-1 set is emitted by `tools/gen_mra.py` or
-supported by this production profile.
+Based on Meathax's `s32multi` core (GPL). Fork with the link code: https://github.com/bonna79/s32multi-mycore
 
-## **Hardware emulated**
+- Source commit: `4fc543f` (the core's build date is shown in the OSD)
+- `outrunners.rbf` md5: `5da6d67d9c9b9594b859f3c413dfc1b5` (4592880 bytes)
+- ROMs are **not** included. Use the same OutRunners ROM set that works with the stock MRA.
 
-| Chip or subsystem | Interface | Implementation / reference |
-| --- | --- | --- |
-| NEC V70-compatible CPU path | 20 MHz Multi 32 bus-rate CE, 16-bit adapter / 24-bit address space | [`s32_v60.sv`](rtl/cpu/v60/s32_v60.sv), [`s32_v60_bus.sv`](rtl/cpu/v60/s32_v60_bus.sv) |
-| Dual Sega 315-5296 I/O | Two JAMMA-edge lanes, buttons, service, coin, timers | [`s32_io.sv`](rtl/io/s32_io.sv), [`Arcade-SegaSystem32Multi.sv`](Arcade-SegaSystem32Multi.sv) |
-| 315-5386 / 315-5387 video engines | Objects, four tilemap layers, VRAM, and buffered dual-screen frame memory | [`s32_sprite.sv`](rtl/video/s32_sprite.sv), [`s32_tilemap.sv`](rtl/video/s32_tilemap.sv), [`s32_fb_if.sv`](rtl/mem/s32_fb_if.sv) |
-| Dual 315-5388 / 315-5242 video output | Two palettes, priority, shadow/highlight, RGB, and A/B composition | [`s32_mixer.sv`](rtl/video/s32_mixer.sv), [`s32_palette.sv`](rtl/video/s32_palette.sv), [`s32_splitscreen_composer.sv`](rtl/video/s32_splitscreen_composer.sv) |
-| BR93C46 EEPROM | Serial NVRAM and MiSTer upload/download | [`s32_io.sv`](rtl/io/s32_io.sv) |
-| 837-7536 / OKI M6253 A/D board | Four-channel ADC for P1/P2 steering, accelerator, and brake | [`s32_driving_controls.sv`](rtl/io/s32_driving_controls.sv), [`s32_io.sv`](rtl/io/s32_io.sv) |
-| Z80 sound CPU | 8 MHz Multi 32 sound domain | [`s32_soundsys.sv`](rtl/audio/s32_soundsys.sv), vendored [`T80`](rtl/audio/T80/) |
-| YM3438 | One FM sound device at the Multi 32 sound rate | [`JT12`](rtl/audio/jt12/), [`s32_soundsys.sv`](rtl/audio/s32_soundsys.sv) |
-| Sega 315-5560 MultiPCM | 10 MHz sample engine, 28 voices, SDRAM sample ROM | [`s32_multipcm.sv`](rtl/audio/s32_multipcm.sv) |
-| MiSTer memory services | HPS download, SDRAM ROMs, DDR3 framebuffers | [`Arcade-SegaSystem32Multi.sv`](Arcade-SegaSystem32Multi.sv), [`sys/`](sys/) |
+## What this is (and is not)
 
-## Credits
+The original twin cabinets talk through a Sega comm board (Z80 + data link controller + 2 KB dual-port RAM) that the game sees as shared RAM at `0x800000` plus two flags (CN/FG) at `0x801000/0x801002`. This core emulates that board at register level, like MAME's `s32comm` simulation, and moves the data between the two MiSTers over a **custom** serial protocol. It is not compatible with real cabinets.
 
-- **Meathax** - OutRunners RTL, integration, MRA generation, verification, and
-  packaging.
-- **Sega, Nemesis1207, and System 32 researchers** - original hardware and
-  public schematic material recorded in [the source ledger](docs/references.md).
-- **MAME developers** - [System 32/Multi 32 behavioural reference](https://github.com/mamedev/mame).
-- **Jose Tejada Gomez / Jotego** - [JT12](https://github.com/jotego/jt12)
-  and audited [JTCORES](https://github.com/jotego/jtcores/tree/c990f843c7bd8eaf26179a0632bac1436cc05b52)
-  reference work.
-- **Daniel Wallner, MikeJ, Mike Johnson, TobiFlex, Sean Riddle, and Sorgelig**
-  - the vendored T80 Z80 core.
-- **furrtek / SiliconRE** - Sega 315-5242 and 315-5385 silicon research.
-- **Umberto Parisi (rmonic79) and Andrea Bogazzi (@asturur)** -
-  [MiSTer-CRT-Adjust](https://github.com/rmonic79/MiSTer-CRT-Adjust/tree/c682de9f4acc61d8f4c7779efb48149d3baa3a8e).
-- **MiSTer-devel and reference-core authors** - MiSTer framework, MRA tooling,
-  and the integration references listed in [reference-cores.md](docs/reference-cores.md).
-- Intel Quartus, Verilator, Icarus Verilog, ModelSim, and MAME tool authors.
+Exactly **two** machines (master + slave). Relay/ISDN mode and 3-4 cabinet rings are not supported.
 
-## License
+## Status
 
-Original core source is licensed under [GNU GPLv3](LICENSE). Vendored
-components retain their own terms and notices:
+Tested:
+- The game's *NETWORK CHECK* reaches `COMMUNICATION SUCCESS`, with `THIS MACHINE ID IS 2` / `THIS MACHINE IS SLAVE`.
+- The link stays up for 30+ minutes (LED shows stage 7, no drop).
 
-- JT12: GPLv3 ([LICENSE](rtl/audio/jt12/LICENSE))
-- T80: BSD-style terms in [`rtl/audio/T80/`](rtl/audio/T80/)
-- SiliconRE material: [SiliconRE licence](docs/references/siliconre/315-5385/SiliconRE-LICENSE)
-- MiSTer framework and Intel/Altera IP: retained upstream/vendor notices
+Not verified yet: the opponent's car moving in a real race (the frames are tested in simulation only). Reports welcome.
 
-Linked reference projects and arcade ROMs remain under their respective terms.
+## Hardware
 
-## How to install
+- Two MiSTers with a USER port (tested: a SuperStation One with its SuperDock, SNAC bypass ON, and a standard MiSTer).
+- One short **USB 3.0 Type-A to Type-A** cable (tested at 30 cm) with **VBUS (pin 1) not connected**. Never join the 5 V rails of two MiSTers. This is the same cable used by the PlayStation link-cable alpha (Kuba-J's PSX_MiSTer_link_cable), which also validated it.
+- Both machines use the same pins; the cable's crossed SuperSpeed pairs do the rest:
+  - TX on `USER_IO[2]` (USB pin 8) arrives at `USER_IO[5]` (USB pin 5) of the other machine.
+  - RX on `USER_IO[5]`.
+  - The port is open-drain (a 1 releases the pin); the FPGA weak pull-ups are enabled.
+- No SNAC device may be attached.
 
-Copy `Arcade-SegaSystem32.rbf` and the MRA files to `/media/fat/_Arcade/`.
-Place the required MAME ROM ZIPs in `/media/fat/games/mame/`, then launch a
-game from the MiSTer Arcade menu.
+## Install
 
-For automatic installation, add this to `/media/fat/downloader.ini` and run
-**Update All**:
-
-```ini
-[meathax/meatcores]
-db_url = https://raw.githubusercontent.com/meathax/meatcores/db/downloader_meathax_meatcores.zip
 ```
+/media/fat/_Arcade/OutRunners (World) Link.mra
+/media/fat/_Arcade/OutRunners (US) Link.mra
+/media/fat/_Arcade/cores/outrunners.rbf        <- only ONE file starting with "outrunners"
+```
+The ROM zips go where the stock MRA expects them (`games/mame/`). The MRAs are the stock ones with only the core name changed.
 
-## Development
+## Setup (both machines)
 
-Quartus Prime 17.0.2 Build 602 is the pinned toolchain. Build the OutRunners
-production profile with `tools/build-segas32.bat`. See
-[PROFILE_CONTRACT.md](PROFILE_CONTRACT.md) for profile rules and verification
-commands.
+OSD:
+- `Cabinet Link` = **Network**
+- `Link Baud` = **250k** (must be the same on both)
+- `Link Test` = **Off**
+- `Comm RAM Clear` = **Once**
+- `Comm Hi Byte` = **FF**
+- `Link Role` and `Cabinet ID` are ignored (the game decides)
+
+In the game, Test menu -> *Network Assignments*:
+- `Communication` = Network
+- `Privilege Mode` = **Master** on one machine and **Slave** on the other
+- `Cabinet ID#` = 1 on the master, 2 on the slave
+- exit the menu (the settings are stored in the game's EEPROM, per MRA file name)
+
+Then Reset both machines from the OSD within a few seconds of each other. Both should show the *NETWORK CHECK* screen and `COMMUNICATION SUCCESS`.
+
+## LED guide (I/O board HDD LED)
+
+With `Link Test = Off`, the LED counts the furthest handshake stage reached, as N flashes, a pause, and repeat. It resets with the OSD Reset.
+
+| Flashes | Meaning |
+|---|---|
+| 0 | the game has not enabled the comm board |
+| 1 | board enabled (CN) |
+| 2 | game wrote the "V70" signature and we answered "Z80" |
+| 3 | the game read the "Z80" reply |
+| 4 | the game wrote its node mode |
+| 5 | valid node mode found, HELLO frames start |
+| 6 | a frame from the other machine arrived |
+| 7 | link up |
+
+Fast flicker: the link had been up and no frame arrived for about 3 seconds.
+
+`Link Test = On` (game stand-alone): the LED is steady while valid frames arrive from the other machine. Use it to check the cable, the pins and the baud rate.
+
+## Please report
+
+- Game region and MRA used, which machine is master and which is slave
+- What each screen shows after Reset, and the LED stage on each machine
+- In a race: does the other car appear, does it follow the other player's steering and speed, any stutter or desync
+- Anything that drops the link (LED flickers fast)
+
+## Credits and license
+
+Core by Meathax (`s32multi`), link code in the fork above. The source of this build is the commit named at the top; the repository's LICENSE file applies (GPL).
+
